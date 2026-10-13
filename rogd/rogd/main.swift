@@ -77,7 +77,7 @@ final class Daemon {
 		case .micMute:
 			log("mic-mute key: \(toggleMicMute())")
 		case .rogKey:
-			log("ROG key pressed (not assigned yet)")
+			break  // opens the menu bar app's panel (the app listens itself)
 		case .auraKey:
 			cycleAura()
 		case nil:
@@ -254,6 +254,9 @@ hup.resume()
 
 let powerSource = IOPSNotificationCreateRunLoopSource({ _ in daemon.powerChanged() }, nil).takeRetainedValue()
 CFRunLoopAddSource(CFRunLoopGetMain(), powerSource, .defaultMode)
+
+let service = Listener()
+service.start()
 
 let timer = Timer(timeInterval: 2, repeats: true) { _ in daemon.poll() }
 RunLoop.main.add(timer, forMode: .default)

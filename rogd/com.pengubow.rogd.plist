@@ -12,6 +12,11 @@
 	<true/>
 	<key>KeepAlive</key>
 	<true/>
+	<key>MachServices</key>
+	<dict>
+		<key>com.pengubow.rogd</key>
+		<true/>
+	</dict>
 	<key>StandardOutPath</key>
 	<string>/Library/Logs/rogd.log</string>
 	<key>StandardErrorPath</key>

@@ -103,9 +103,18 @@ if [[ "$(uname)" == Darwin ]]; then
     for tool in rogd rogctl; do
         echo "SWIFT $tool"
         "$swiftc" "${swiftflags[@]}" -module-name "$tool" -o "$out/$tool" \
-            "$here"/rogd/Shared/*.swift "$here/rogd/$tool/main.swift"
+            "$here"/rogd/Shared/*.swift "$here/rogd/$tool"/*.swift
         echo "built $out/$tool"
     done
+    # Menu bar app
+    app="$out/RogControl.app"
+    echo "SWIFT RogControl.app"
+    mkdir -p "$app/Contents/MacOS"
+    "$swiftc" "${swiftflags[@]}" -framework AppKit -framework SwiftUI -module-name RogControlMenu \
+        -o "$app/Contents/MacOS/RogControl" "$here"/rogd/Shared/*.swift "$here"/menubar/*.swift
+    sed "s/@VERSION@/$version/g" "$here/menubar/Info.plist" > "$app/Contents/Info.plist"
+    codesign -f -s - "$app" 2>/dev/null
+    echo "built $app"
 else
-    echo "skipping rogd and rogctl (Swift, macOS only)"
+    echo "skipping rogd, rogctl and the menu bar app (Swift, macOS only)"
 fi

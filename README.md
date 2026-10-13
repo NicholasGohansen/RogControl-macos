@@ -30,9 +30,7 @@ same ASUS WMI calls Linux `asus-wmi` makes (`\_SB.ATKD.WMNB`):
   zones; which lights stay on at boot/awake/sleep/shutdown), with the packets asusd sends;
   the Aura key cycles the modes
 
-- profiles applied by `rogd`, edited with `rogctl` (below)
-
-Planned: menu-bar app.
+- profiles applied by `rogd`, edited with `rogctl` or the menu bar app (below)
 
 ## Requirements
 
@@ -44,7 +42,7 @@ Planned: menu-bar app.
 
 ```sh
 git submodule update --init
-./build.sh Release        # build/Release/RogControl.kext and rogctl
+./build.sh Release        # build/Release: RogControl.kext, rogd, rogctl, RogControl.app
 ```
 
 macOS: Xcode or the Command Line Tools. Linux: cross build with Apple clang/ld64,
@@ -89,6 +87,15 @@ sudo rogctl aura speed high | direction left
 sudo rogctl aura power lightbar off sleep    # keyboard|lightbar|all on|off [boot|awake|sleep|shutdown]
 rogctl config
 ```
+
+### Menu bar app
+
+`RogControl.app` (installed by `tools/install.sh` into /Applications, started at login by a
+LaunchAgent) shows the CPU and GPU temperatures in the menu bar. Its panel has the fans, the
+profile and power-source switching, keyboard light, Aura mode/colour/speed, screen
+brightness, touchpad and charge limit. The ROG key (or opening the app again) shows the
+panel. It reads the kext directly and sends changes to `rogd` over XPC
+(`com.pengubow.rogd`), which accepts administrators only, so no sudo is needed.
 
 ### Coming from Linux asusctl
 
