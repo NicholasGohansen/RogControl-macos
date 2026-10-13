@@ -13,6 +13,7 @@
 #include <kern/task.h>
 #include <pexpert/pexpert.h>
 #include <Headers/kern_version.hpp>
+#include <Headers/kern_api.hpp>
 
 OSDefineMetaClassAndStructors(RogControl, IOService)
 
@@ -44,6 +45,37 @@ static bool rogRdmsr(uint32_t msr, uint64_t &value) {
 	value = (static_cast<uint64_t>(hi) << 32) | lo;
 	return true;
 }
+
+// Keyboard hotkeys: the N-KEY keyboard sends Fn keys as input report 0x5A <code>, which
+// macOS ignores and Karabiner (which holds the keyboard exclusively) drops. Every report of
+// every HID device passes IOHIDDevice::handleReportWithTime() before that, also while a client
+// has seized the device, so RogControl wraps it (through Lilu) and picks out the N-KEY's.
+static mach_vm_address_t orgHandleReportWithTime {0};
+static _Atomic(IOHIDDevice *) hookKeyboard;         // statics start zeroed
+static _Atomic(uint32_t) hookCode;
+static _Atomic(IOInterruptEventSource *) hookSignal;
+
+static IOReturn wrapHandleReportWithTime(IOHIDDevice *that, AbsoluteTime timeStamp, IOMemoryDescriptor *report,
+	IOHIDReportType reportType, IOOptionBits options) {
+	if (that == atomic_load_explicit(&hookKeyboard, memory_order_relaxed) && reportType == kIOHIDReportTypeInput &&
+		report && report->getLength() >= 2) {
+		uint8_t head[2] {};
+		auto buffer = OSDynamicCast(IOBufferMemoryDescriptor, report);
+		if (buffer && buffer->getBytesNoCopy())
+			lilu_os_memcpy(head, buffer->getBytesNoCopy(), sizeof(head));
+		else
+			report->readBytes(0, head, sizeof(head));
+		auto signal = atomic_load_explicit(&hookSignal, memory_order_acquire);
+		if (head[0] == Rog::KbdReportID && head[1] != 0 && signal) {
+			atomic_store_explicit(&hookCode, head[1], memory_order_release);
+			signal->interruptOccurred(nullptr, nullptr, 0);
+		}
+	}
+	return FunctionCast(wrapHandleReportWithTime, orgHandleReportWithTime)(that, timeStamp, report, reportType, options);
+}
+
+static const char *hidFamilyPaths[] {"/System/Library/Extensions/IOHIDFamily.kext/Contents/MacOS/IOHIDFamily"};
+static KernelPatcher::KextInfo hidFamily {"com.apple.iokit.IOHIDFamily", hidFamilyPaths, 1, {true}, {}, KernelPatcher::KextInfo::Unloaded};
 
 namespace {
 // One request for every core: Linux amd-pstate (active mode) does the same per CPU,
@@ -247,6 +279,7 @@ bool RogControl::writeChargeLimit(uint8_t limit) {
 IOHIDDevice *RogControl::findKeyboard() {
 	if (kbd && !kbd->isInactive())
 		return kbd;
+	atomic_store_explicit(&hookKeyboard, static_cast<IOHIDDevice *>(nullptr), memory_order_release);
 	OSSafeReleaseNULL(kbd);
 	kbdReady = false;
 
@@ -275,8 +308,10 @@ IOHIDDevice *RogControl::findKeyboard() {
 	OSSafeReleaseNULL(vendor);
 	OSSafeReleaseNULL(props);
 	OSSafeReleaseNULL(match);
-	if (kbd)
-		DBGLOG("rog", "N-KEY keyboard found");
+	if (kbd) {
+		atomic_store_explicit(&hookKeyboard, kbd, memory_order_release);
+		SYSLOG("rog", "N-KEY keyboard found, hotkey hook %s", orgHandleReportWithTime ? "active" : "not installed");
+	}
 	return kbd;
 }
 
@@ -318,6 +353,78 @@ bool RogControl::writeKbdLevel(uint8_t level) {
 		return false;
 	kbdLevel = level;
 	kbdPending = false;
+	return true;
+}
+
+void RogControl::findBacklight() {
+	auto match = IOService::serviceMatching("IOACPIPlatformDevice");
+	if (!match)
+		return;
+	if (auto it = IOService::getMatchingServices(match)) {
+		while (auto obj = it->getNextObject()) {
+			auto dev = OSDynamicCast(IOACPIPlatformDevice, obj);
+			if (!dev || dev == atkd || dev->validateObject("WMAA") != kIOReturnSuccess)
+				continue;
+			OSObject *wdg = nullptr;
+			bool nvidia = false;
+			if (dev->evaluateObject("_WDG", &wdg) == kIOReturnSuccess) {
+				auto data = OSDynamicCast(OSData, wdg);
+				// _WDG: 20-byte blocks starting with the GUID
+				for (unsigned off = 0; data && off + 20 <= data->getLength(); off += 20)
+					if (!memcmp(static_cast<const uint8_t *>(data->getBytesNoCopy()) + off, Rog::NvWmiBacklightGuid, 16))
+						nvidia = true;
+			}
+			OSSafeReleaseNULL(wdg);
+			if (nvidia) {
+				dev->retain();
+				backlightWmi = dev;
+				break;
+			}
+		}
+		it->release();
+	}
+	match->release();
+	uint32_t v = 0;
+	if (backlightWmi && backlightCall(Rog::BacklightMethodLevel, Rog::BacklightGetMax, 0, v) && v && v <= 1000) {
+		screenMax = v;
+		if (backlightCall(Rog::BacklightMethodSource, Rog::BacklightGet, 0, v))
+			screenSource = v;
+		if (backlightCall(Rog::BacklightMethodLevel, Rog::BacklightGet, 0, v))
+			screenLevel = v;
+	}
+	SYSLOG("rog", "screen backlight: WMI %d, max %u, source %u, level %u", backlightWmi != nullptr, screenMax, screenSource, screenLevel);
+}
+
+bool RogControl::backlightCall(uint32_t method, uint32_t mode, uint32_t value, uint32_t &result) {
+	if (!backlightWmi)
+		return false;
+	// Linux struct wmi_brightness_args { u32 mode; u32 val; u32 ret; u32 ignored[3]; }
+	uint32_t args[6] = {mode, value, 0, 0, 0, 0};
+	OSObject *params[3] = {
+		OSNumber::withNumber(0ULL, 32),
+		OSNumber::withNumber(method, 32),
+		OSData::withBytes(args, sizeof(args)),
+	};
+	OSObject *out = nullptr;
+	IOReturn ret = kIOReturnNoMemory;
+	if (params[0] && params[1] && params[2])
+		ret = backlightWmi->evaluateObject("WMAA", &out, params, 3);
+	for (auto &p : params)
+		OSSafeReleaseNULL(p);
+	auto num = OSDynamicCast(OSNumber, out);
+	if (num)
+		result = num->unsigned32BitValue();
+	OSSafeReleaseNULL(out);
+	return ret == kIOReturnSuccess && num;
+}
+
+bool RogControl::setScreenLevel(uint32_t level) {
+	if (!screenMax || level > screenMax)
+		return false;
+	uint32_t ignored = 0;
+	if (!backlightCall(Rog::BacklightMethodLevel, Rog::BacklightSet, level, ignored))
+		return false;
+	screenLevel = level;
 	return true;
 }
 
@@ -506,6 +613,15 @@ void RogControl::loadNvramSettings() {
 	if (charge >= 20 && charge <= 100)
 		writeChargeLimit(static_cast<uint8_t>(charge));
 
+	// Screen brightness: the firmware starts at its own level; put the last one back.
+	options = IORegistryEntry::fromPath("/options", gIODTPlane);
+	if (options) {
+		auto b = OSDynamicCast(OSData, options->getProperty("rog-screen-light"));
+		if (b && b->getLength() == 1 && *static_cast<const uint8_t *>(b->getBytesNoCopy()) <= screenMax)
+			setScreenLevel(*static_cast<const uint8_t *>(b->getBytesNoCopy()));
+		options->release();
+	}
+
 	// Keyboard backlight level (Fn+F2/F3, rogctl kbd); written once the keyboard is up.
 	options = IORegistryEntry::fromPath("/options", gIODTPlane);
 	if (options) {
@@ -568,6 +684,11 @@ void RogControl::publishStatus() {
 	setProperty("KeyboardBrightness", kbdLevel, 32);
 	setProperty("KeyboardFound", kbd != nullptr && !kbd->isInactive());
 	setProperty("TouchpadEnabled", touchpadEnabled);
+	if (screenMax) {
+		setProperty("ScreenBrightness", screenLevel, 32);
+		setProperty("ScreenBrightnessMax", screenMax, 32);
+		setProperty("ScreenBrightnessSource", screenSource, 32);
+	}
 	setProperty("LastHotkey", lastHotkey, 32);
 	setProperty("HotkeyCount", hotkeyCount, 32);
 	setProperty("CPUMaxFrequencyMHz", cpuMaxMHz, 32);
@@ -626,8 +747,21 @@ void RogControl::cyclePerfMode() {
 }
 
 void RogControl::handleAtkEvent(uint32_t code) {
-	DBGLOG("rog", "ATK event %02X", code);
+	handleHotkey(code, false);
+}
+
+void RogControl::handleHotkey(uint32_t code, bool fromKeyboard) {
+	DBGLOG("rog", "%s hotkey %02X", fromKeyboard ? "keyboard" : "ATK", code);
+	// Some models send a key both ways (ATK and keyboard); take the first of such a pair.
+	uint64_t now = 0;
+	absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+	bool duplicate = hotkeyCount && code == lastHotkey && fromKeyboard != lastHotkeyFromKeyboard &&
+		now - lastHotkeyTime < 200 * 1000 * 1000ULL;
+	lastHotkeyTime = now;
+	lastHotkeyFromKeyboard = fromKeyboard;
 	lastHotkey = code;
+	if (duplicate)
+		return;
 	hotkeyCount++;
 	if (code == Rog::EventThermalPolicy || code == Rog::EventFanBoost) {
 		cyclePerfMode();
@@ -641,6 +775,15 @@ void RogControl::handleAtkEvent(uint32_t code) {
 			storeNvramByte("rog-kbd-light", level);
 	} else if (code == Rog::EventTouchpadToggle) {
 		setTouchpad(!touchpadEnabled);
+	} else if ((code == Rog::EventScreenDown || code == Rog::EventScreenUp) && screenMax) {
+		uint32_t step = screenMax / Rog::ScreenSteps ? screenMax / Rog::ScreenSteps : 1;
+		uint32_t level = screenLevel;
+		if (code == Rog::EventScreenUp)
+			level = level + step > screenMax ? screenMax : level + step;
+		else
+			level = level > step ? level - step : 0;
+		if (setScreenLevel(level))
+			screenSaveIn = 3;
 	}
 	messageClients(Rog::MessageHotkey, reinterpret_cast<void *>(static_cast<uintptr_t>(code)));
 	publishStatus();
@@ -696,6 +839,14 @@ IOReturn RogControl::setPropertiesGated(OSDictionary *dict) {
 			userCurveValid[i] = false;
 			controlChanged = true;
 		}
+	}
+
+	if (auto num = OSDynamicCast(OSNumber, dict->getObject("ScreenBrightness"))) {
+		auto level = num->unsigned32BitValue();
+		if (!setScreenLevel(level))
+			ret = kIOReturnBadArgument;
+		else
+			storeNvramByte("rog-screen-light", static_cast<uint8_t>(level));
 	}
 
 	if (auto flag = OSDynamicCast(OSBoolean, dict->getObject("TouchpadEnabled"))) {
@@ -812,6 +963,8 @@ IOService *RogControl::probe(IOService *provider, SInt32 *score) {
 	for (size_t i = 0; i < Rog::TunableCount; i++)
 		haveTunable[i] = wmnbInt(Rog::MethodDsts, Rog::Tunables[i].device, 0, v) && v != Rog::DstsUnsupported && (v & Rog::DstsPresent);
 
+	findBacklight();
+
 	// CPPC: CPUID 0x80000008 EBX bit 27. Nominal clock from P-state 0 (CpuFid / CpuDfsId * 200 MHz).
 	cppcAllowed = !checkKernelArgument("-rogcontrolnocppc");
 	uint32_t eax = 0x80000008, ebx = 0, ecx = 0, edx = 0;
@@ -922,6 +1075,10 @@ bool RogControl::start(IOService *provider) {
 			self->cpuDirty = false;
 			self->applyCpuLimit();
 		}
+		if (!self->kbd || self->kbd->isInactive())
+			self->findKeyboard();
+		if (self->screenSaveIn && --self->screenSaveIn == 0)
+			self->storeNvramByte("rog-screen-light", static_cast<uint8_t>(self->screenLevel));
 		if (self->kbdPending) {
 			if (self->writeKbdLevel(self->kbdLevel) || ++self->kbdWaited > Rog::KbdRetrySeconds)
 				self->kbdPending = false;
@@ -931,7 +1088,13 @@ bool RogControl::start(IOService *provider) {
 		sender->setTimeoutMS(Rog::PollIntervalMS);
 	});
 
-	if (!workLoop || !commandGate || !poller ||
+	hotkeySource = IOInterruptEventSource::interruptEventSource(this, [](OSObject *owner, IOInterruptEventSource *, int) {
+		auto self = OSDynamicCast(RogControl, owner);
+		uint32_t code = atomic_exchange_explicit(&hookCode, 0, memory_order_acq_rel);
+		if (self && code)
+			self->handleHotkey(code, true);
+	});
+	if (!workLoop || !commandGate || !poller || !hotkeySource || workLoop->addEventSource(hotkeySource) != kIOReturnSuccess ||
 		workLoop->addEventSource(commandGate) != kIOReturnSuccess ||
 		workLoop->addEventSource(poller) != kIOReturnSuccess) {
 		SYSLOG("rog", "failed to set up the work loop");
@@ -950,6 +1113,7 @@ bool RogControl::start(IOService *provider) {
 		return false;
 	}
 
+	atomic_store_explicit(&hookSignal, hotkeySource, memory_order_release);
 	poller->setTimeoutMS(Rog::PollIntervalMS);
 	registerService();
 	return true;
@@ -1042,6 +1206,19 @@ void RogControl::stop(IOService *provider) {
 EXPORT extern "C" kern_return_t ADDPR(kern_start)(kmod_info_t *, void *) {
 	lilu_get_boot_args("liludelay", &ADDPR(debugPrintDelay), sizeof(ADDPR(debugPrintDelay)));
 	ADDPR(debugEnabled) = checkKernelArgument("-vsmcdbg") || checkKernelArgument("-rogcontroldbg") || checkKernelArgument("-liludbgall");
+	if (!checkKernelArgument("-rogcontrolnohid") && lilu.requestAccess() == LiluAPI::Error::NoError) {
+		auto err = lilu.onKextLoad(&hidFamily, 1, [](void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+			if (index != hidFamily.loadIndex)
+				return;
+			KernelPatcher::RouteRequest request("__ZN11IOHIDDevice20handleReportWithTimeEyP18IOMemoryDescriptor15IOHIDReportTypej",
+				wrapHandleReportWithTime, orgHandleReportWithTime);
+			if (!patcher.routeMultiple(index, &request, 1, address, size))
+				SYSLOG("rog", "keyboard hotkey hook failed: %d", patcher.getError());
+		});
+		if (err != LiluAPI::Error::NoError)
+			SYSLOG("rog", "keyboard hotkey hook not registered: %d", err);
+		lilu.releaseAccess();
+	}
 	return KERN_SUCCESS;
 }
 

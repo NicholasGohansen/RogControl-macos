@@ -1,5 +1,5 @@
 // rogd: applies RogControl profiles (the macOS counterpart of asusd).
-//   - at start, the profile for the current power source (auto profile) or the current mode
+//   - at start, the profile of the mode the kext restored (the last one used, kept in NVRAM)
 //   - when the performance mode changes (Fn+F5, rogctl profile): that profile's curves, EPP, tunings
 //   - on AC <-> battery: the configured profile, or the other set of tunings
 //   - SIGHUP (sent by rogctl after editing the config): reload and apply again
@@ -14,7 +14,8 @@ func log(_ message: String) {
 	print("\(timestamp()) \(message)")
 }
 
-/// RogControl.kext sends every ASUS ATK hotkey as iokit_vendor_specific_msg(0x52), code in the argument.
+/// RogControl.kext sends every ASUS hotkey (ATK event or keyboard report 0x5A) as
+/// iokit_vendor_specific_msg(0x52), code in the argument.
 let hotkeyMessage: UInt32 = 0xE000_0000 | (0xFFE << 14) | 0x52
 
 enum Hotkey: UInt32 {
@@ -52,7 +53,7 @@ final class Daemon {
 	var notifyPort: IONotificationPortRef?
 	var hotkeyNotification: io_object_t = 0
 
-	/// Hotkeys the kext doesn't handle itself (it does Fn+F5, Fn+F2/F3 and Fn+F10).
+	/// Hotkeys the kext doesn't handle itself (it does Fn+F5, Fn+F2/F3, Fn+F7/F8 and Fn+F10).
 	func listenForHotkeys() {
 		guard let kext = kext, hotkeyNotification == 0 else { return }
 		notifyPort = IONotificationPortCreate(kIOMainPortDefault)
@@ -112,18 +113,21 @@ final class Daemon {
 		log("applied \(name) (\(reason), \(battery ? "battery" : "AC"))\(ret == KERN_SUCCESS ? "" : String(format: ", kext rejected a value (0x%x)", ret))")
 	}
 
-	/// The profile to use now: the auto profile for the power source, else the current mode.
+	/// The profile of the current mode: the kext restores the last mode from NVRAM at boot,
+	/// so this is whatever was used last (Fn+F5, rogctl profile, or an auto switch).
 	func currentProfile() -> String {
-		if let auto = config.autoProfile, auto.enabled,
-			let target = onBatteryPower() ? auto.onBattery : auto.onAc, profileNames.contains(target) {
-			return target
-		}
-		return kext?.mode.flatMap(profileName(forKextMode:)) ?? "balanced"
+		kext?.mode.flatMap(profileName(forKextMode:)) ?? "balanced"
+	}
+
+	/// The auto profile for the power source, if switching on AC/battery is enabled.
+	func autoProfile() -> String? {
+		guard let auto = config.autoProfile, auto.enabled,
+			let target = onBatteryPower() ? auto.onBattery : auto.onAc, profileNames.contains(target) else { return nil }
+		return target
 	}
 
 	func applyCurrent(reason: String) {
-		let name = currentProfile()
-		apply(profile: name, setMode: kextMode(forProfile: name) != kext?.mode, reason: reason)
+		apply(profile: currentProfile(), setMode: false, reason: reason)
 	}
 
 	func poll() {
@@ -145,10 +149,10 @@ final class Daemon {
 	func powerChanged() {
 		let battery = onBatteryPower()
 		guard battery != lastOnBattery else { return }
-		if config.autoProfile?.enabled == true {
+		if let target = autoProfile() {
+			apply(profile: target, setMode: kextMode(forProfile: target) != kext?.mode, reason: "power source changed")
+		} else {
 			applyCurrent(reason: "power source changed")
-		} else if let mode = kext?.mode, let name = profileName(forKextMode: mode) {
-			apply(profile: name, setMode: false, reason: "power source changed")
 		}
 	}
 }

@@ -16,6 +16,7 @@
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOCommandGate.h>
 #include <IOKit/IOTimerEventSource.h>
+#include <IOKit/IOInterruptEventSource.h>
 #include <IOKit/acpi/IOACPIPlatformDevice.h>
 #include <IOKit/pwr_mgt/RootDomain.h>
 #include <IOKit/hid/IOHIDDevice.h>
@@ -81,6 +82,11 @@ namespace Rog {
 	constexpr uint32_t EventKbdLightUp = 0xC4;
 	constexpr uint32_t EventKbdLightDown = 0xC5;
 	constexpr uint32_t EventTouchpadToggle = 0x6B;   // Fn+F10
+	// The N-KEY keyboard reports the same codes in input report 0x5A (Linux hid-asus,
+	// usage page 0xFF31), plus screen brightness, which the ATK path never sends here.
+	constexpr uint32_t EventScreenDown = 0x10;       // Fn+F7
+	constexpr uint32_t EventScreenUp = 0x20;         // Fn+F8
+	constexpr uint32_t ScreenSteps = 16;             // like macOS brightness keys
 
 	// VoodooI2C(HID) multitouch driver messages (the AsusSMC / VoodooPS2 convention), data is bool *
 	constexpr uint32_t MessageSetTouchStatus = iokit_vendor_specific_msg(100);
@@ -91,6 +97,14 @@ namespace Rog {
 	constexpr uint8_t KbdReportID = 0x5A;
 	constexpr uint8_t KbdMaxLevel = 3;
 	constexpr uint32_t KbdRetrySeconds = 180;
+
+	// Panel backlight in dGPU (MUX) mode: NVIDIA "WMI EC backlight" (Linux nvidia-wmi-ec-backlight),
+	// WMAA(0, method, {u8 mode @0, u32 value @4}) on the PNP0C14 device whose _WDG has this GUID.
+	constexpr uint8_t NvWmiBacklightGuid[16] = {0x13, 0x96, 0x3E, 0x60, 0x25, 0xEF, 0x38, 0x43,
+		0xA3, 0xD0, 0xC4, 0x61, 0x77, 0x51, 0x6D, 0xB7};
+	constexpr uint32_t BacklightMethodLevel = 1, BacklightMethodSource = 2;
+	constexpr uint32_t BacklightGet = 0, BacklightSet = 1, BacklightGetMax = 2;
+	constexpr uint32_t BacklightSourceEC = 2;
 
 	// Every ATK hotkey is also sent to user-space clients (rogd) with this message, code in the argument.
 	constexpr uint32_t MessageHotkey = iokit_vendor_specific_msg(0x52);
@@ -173,6 +187,14 @@ class EXPORT RogControl : public IOService {
 	bool kbdPending {false};        // level still to be written (keyboard not up yet)
 	uint32_t kbdWaited {0};
 	uint8_t kbdLevel {Rog::KbdMaxLevel};
+	IOACPIPlatformDevice *backlightWmi {nullptr};
+	uint32_t screenMax {0};          // 0 = no WMI EC backlight
+	uint32_t screenSource {0};
+	uint32_t screenLevel {0};
+	uint32_t screenSaveIn {0};       // polls until the level is written to NVRAM
+	IOInterruptEventSource *hotkeySource {nullptr};
+	uint64_t lastHotkeyTime {0};
+	bool lastHotkeyFromKeyboard {false};
 	bool touchpadEnabled {true};
 	bool touchpadFound {false};
 	uint32_t lastHotkey {0};
@@ -217,6 +239,10 @@ class EXPORT RogControl : public IOService {
 	bool sendKbdReport(const uint8_t *bytes, size_t len);
 	bool writeKbdLevel(uint8_t level);
 	bool setTouchpad(bool enable);
+	void findBacklight();
+	bool backlightCall(uint32_t method, uint32_t mode, uint32_t value, uint32_t &result);
+	bool setScreenLevel(uint32_t level);
+	void handleHotkey(uint32_t code, bool fromKeyboard);
 	void applyCpuLimit();
 
 	void refreshSensors();
