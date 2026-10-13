@@ -16,7 +16,8 @@ usage: rogctl [status]                       fans, temperatures, profile, CPU/po
        rogctl curve cpu|gpu T:P,T:P,... (8 points) [-p P]
        rogctl curve reset [-p P]             firmware fan curves for that profile
        rogctl charge <20-100>                battery charge limit
-       rogctl kbd <0-3>                      keyboard backlight (also Fn+F2 / Fn+F3)
+       rogctl kbd <0-3>                      keyboard backlight (also Fn+F2 / Fn+F3; 0 = off)
+       rogctl touchpad on|off                (also Fn+F10)
        rogctl fan <0-100>|auto               force both fans now (not saved)
        rogctl config                         show the config file
 
@@ -74,6 +75,7 @@ func showStatus() {
 	print("Power limits     : \(power.isEmpty ? "not supported" : power.joined(separator: ", "))")
 	print("GPU (NVIDIA)     : \(gpu.isEmpty ? "not supported" : gpu.joined(separator: ", "))")
 	if let charge = num(p, "ChargeLimit"), charge > 0 { print("Charge limit     : \(charge)%") }
+	if let touchpad = p["TouchpadEnabled"] as? Bool { print("Touchpad         : \(touchpad ? "on" : "off")") }
 	if let level = num(p, "KeyboardBrightness") {
 		print("Keyboard light   : \(level)/3\(p["KeyboardFound"] as? Bool == true ? "" : " (keyboard not found yet)")")
 	}
@@ -242,6 +244,12 @@ case "kbd":
 	let ret = kext.set(["KeyboardBrightness": level])
 	if ret == kIOReturnNotPrivileged { fail("permission denied, run with sudo") }
 	if ret != KERN_SUCCESS { fail(String(format: "the keyboard did not take it (0x%x)", ret)) }
+	showStatus()
+case "touchpad":
+	guard args == ["on"] || args == ["off"] else { fail("touchpad needs on or off") }
+	let ret = kext.set(["TouchpadEnabled": args[0] == "on"])
+	if ret == kIOReturnNotPrivileged { fail("permission denied, run with sudo") }
+	if ret != KERN_SUCCESS { fail(String(format: "no touchpad driver answered (0x%x)", ret)) }
 	showStatus()
 case "fan":
 	guard args.count == 1 else { fail(usage, code: 2) }

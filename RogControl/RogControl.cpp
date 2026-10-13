@@ -321,6 +321,32 @@ bool RogControl::writeKbdLevel(uint8_t level) {
 	return true;
 }
 
+bool RogControl::setTouchpad(bool enable) {
+	// VoodooI2CMultitouchHIDEventDriver::message(): kKeyboardSetTouchStatus ignores or resumes input.
+	bool found = false;
+	auto match = IOService::serviceMatching("VoodooI2CMultitouchHIDEventDriver");
+	if (match) {
+		if (auto it = IOService::getMatchingServices(match)) {
+			while (auto obj = it->getNextObject()) {
+				auto svc = OSDynamicCast(IOService, obj);
+				if (!svc)
+					continue;
+				bool value = enable;
+				svc->message(Rog::MessageSetTouchStatus, this, &value);
+				found = true;
+			}
+			it->release();
+		}
+		match->release();
+	}
+	touchpadFound = found;
+	if (found) {
+		touchpadEnabled = enable;
+		SYSLOG("rog", "touchpad %s", enable ? "enabled" : "disabled");
+	}
+	return found;
+}
+
 void RogControl::writeTunables() {
 	for (size_t i = 0; i < Rog::TunableCount; i++) {
 		if (!haveTunable[i] || !tunable[i])
@@ -541,6 +567,7 @@ void RogControl::publishStatus() {
 	setProperty("FanControl", control);
 	setProperty("KeyboardBrightness", kbdLevel, 32);
 	setProperty("KeyboardFound", kbd != nullptr && !kbd->isInactive());
+	setProperty("TouchpadEnabled", touchpadEnabled);
 	setProperty("LastHotkey", lastHotkey, 32);
 	setProperty("HotkeyCount", hotkeyCount, 32);
 	setProperty("CPUMaxFrequencyMHz", cpuMaxMHz, 32);
@@ -612,6 +639,8 @@ void RogControl::handleAtkEvent(uint32_t code) {
 			level--;
 		if (writeKbdLevel(level))
 			storeNvramByte("rog-kbd-light", level);
+	} else if (code == Rog::EventTouchpadToggle) {
+		setTouchpad(!touchpadEnabled);
 	}
 	messageClients(Rog::MessageHotkey, reinterpret_cast<void *>(static_cast<uintptr_t>(code)));
 	publishStatus();
@@ -667,6 +696,11 @@ IOReturn RogControl::setPropertiesGated(OSDictionary *dict) {
 			userCurveValid[i] = false;
 			controlChanged = true;
 		}
+	}
+
+	if (auto flag = OSDynamicCast(OSBoolean, dict->getObject("TouchpadEnabled"))) {
+		if (!setTouchpad(flag->isTrue()))
+			ret = kIOReturnNotFound;
 	}
 
 	if (auto num = OSDynamicCast(OSNumber, dict->getObject("KeyboardBrightness"))) {

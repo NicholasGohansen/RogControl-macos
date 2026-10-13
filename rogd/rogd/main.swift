@@ -4,6 +4,7 @@
 //   - on AC <-> battery: the configured profile, or the other set of tunings
 //   - SIGHUP (sent by rogctl after editing the config): reload and apply again
 // Runs as root from /Library/LaunchDaemons/com.pengubow.rogd.plist.
+import CoreAudio
 import Foundation
 import IOKit.ps
 
@@ -13,11 +14,69 @@ func log(_ message: String) {
 	print("\(timestamp()) \(message)")
 }
 
+/// RogControl.kext sends every ASUS ATK hotkey as iokit_vendor_specific_msg(0x52), code in the argument.
+let hotkeyMessage: UInt32 = 0xE000_0000 | (0xFFE << 14) | 0x52
+
+enum Hotkey: UInt32 {
+	case micMute = 0x7C
+	case rogKey = 0x38
+	case auraKey = 0xB3
+}
+
+/// Mutes or unmutes the default input device (the keyboard's mic-mute key).
+func toggleMicMute() -> String {
+	var device = AudioObjectID(kAudioObjectUnknown)
+	var size = UInt32(MemoryLayout<AudioObjectID>.size)
+	var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultInputDevice,
+		mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+	guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &device) == noErr,
+		device != kAudioObjectUnknown else { return "no input device" }
+	address = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyMute,
+		mScope: kAudioDevicePropertyScopeInput, mElement: kAudioObjectPropertyElementMain)
+	var muted: UInt32 = 0
+	size = UInt32(MemoryLayout<UInt32>.size)
+	guard AudioObjectHasProperty(device, &address),
+		AudioObjectGetPropertyData(device, &address, 0, nil, &size, &muted) == noErr else {
+		return "input device has no mute control"
+	}
+	muted = muted == 0 ? 1 : 0
+	let ret = AudioObjectSetPropertyData(device, &address, 0, nil, size, &muted)
+	return ret == noErr ? (muted == 1 ? "microphone muted" : "microphone unmuted") : "mute failed (\(ret))"
+}
+
 final class Daemon {
 	var config = Config()
 	var kext: RogKext?
 	var lastMode: String?
 	var lastOnBattery = onBatteryPower()
+	var notifyPort: IONotificationPortRef?
+	var hotkeyNotification: io_object_t = 0
+
+	/// Hotkeys the kext doesn't handle itself (it does Fn+F5, Fn+F2/F3 and Fn+F10).
+	func listenForHotkeys() {
+		guard let kext = kext, hotkeyNotification == 0 else { return }
+		notifyPort = IONotificationPortCreate(kIOMainPortDefault)
+		guard let port = notifyPort else { return }
+		CFRunLoopAddSource(CFRunLoopGetMain(), IONotificationPortGetRunLoopSource(port).takeUnretainedValue(), .defaultMode)
+		let ret = IOServiceAddInterestNotification(port, kext.service, kIOGeneralInterest, { _, _, type, argument in
+			guard type == hotkeyMessage else { return }
+			daemon.hotkey(UInt32(UInt(bitPattern: argument)))
+		}, nil, &hotkeyNotification)
+		if ret != KERN_SUCCESS { log(String(format: "hotkey notifications unavailable (0x%x)", ret)) }
+	}
+
+	func hotkey(_ code: UInt32) {
+		switch Hotkey(rawValue: code) {
+		case .micMute:
+			log("mic-mute key: \(toggleMicMute())")
+		case .rogKey:
+			log("ROG key pressed (not assigned yet)")
+		case .auraKey:
+			log("Aura key pressed (not assigned yet)")
+		case nil:
+			break
+		}
+	}
 
 	func loadConfig() {
 		do {
@@ -72,6 +131,7 @@ final class Daemon {
 			kext = RogKext()
 			if kext != nil {
 				log("RogControl.kext found")
+				listenForHotkeys()
 				applyCurrent(reason: "start")
 			}
 			return

@@ -80,6 +80,11 @@ namespace Rog {
 	// Fn+F3 / Fn+F2 keyboard backlight (EC queries 0x17 / 0x16)
 	constexpr uint32_t EventKbdLightUp = 0xC4;
 	constexpr uint32_t EventKbdLightDown = 0xC5;
+	constexpr uint32_t EventTouchpadToggle = 0x6B;   // Fn+F10
+
+	// VoodooI2C(HID) multitouch driver messages (the AsusSMC / VoodooPS2 convention), data is bool *
+	constexpr uint32_t MessageSetTouchStatus = iokit_vendor_specific_msg(100);
+	constexpr uint32_t MessageGetTouchStatus = iokit_vendor_specific_msg(101);
 
 	// N-KEY USB keyboard (Linux hid-asus): feature report 0x5A
 	constexpr uint32_t AsusVendorID = 0x0B05;
@@ -168,6 +173,8 @@ class EXPORT RogControl : public IOService {
 	bool kbdPending {false};        // level still to be written (keyboard not up yet)
 	uint32_t kbdWaited {0};
 	uint8_t kbdLevel {Rog::KbdMaxLevel};
+	bool touchpadEnabled {true};
+	bool touchpadFound {false};
 	uint32_t lastHotkey {0};
 	uint32_t hotkeyCount {0};
 
@@ -209,6 +216,7 @@ class EXPORT RogControl : public IOService {
 	IOHIDDevice *findKeyboard();
 	bool sendKbdReport(const uint8_t *bytes, size_t len);
 	bool writeKbdLevel(uint8_t level);
+	bool setTouchpad(bool enable);
 	void applyCpuLimit();
 
 	void refreshSensors();
