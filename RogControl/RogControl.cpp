@@ -12,7 +12,6 @@
 #include <IOKit/acpi/IOACPITypes.h>
 #include <kern/task.h>
 #include <kern/clock.h>
-#include <IOKit/hid/AppleHIDUsageTables.h>
 #include <IOKit/hid/IOHIDUsageTables.h>
 #include <pexpert/pexpert.h>
 #include <Headers/kern_version.hpp>
@@ -687,7 +686,7 @@ void RogControl::publishStatus() {
 	setProperty("LastHotkey", lastHotkey, 32);
 	setProperty("HotkeyCount", hotkeyCount, 32);
 	setProperty("KeyboardHotkeyHook", orgHandleReportWithTime != 0);
-	setProperty("BrightnessKeys", keys ? (brightnessKeys == Rog::BrightnessKeysConsumer ? "consumer" : "topcase") : "unavailable");
+	setProperty("BrightnessKeys", keys != nullptr);
 	if (auto log = OSArray::withCapacity(Rog::EventLogSize)) {
 		uint32_t first = eventCount > Rog::EventLogSize ? eventCount - static_cast<uint32_t>(Rog::EventLogSize) : 0;
 		for (uint32_t i = first; i < eventCount; i++) {
@@ -782,12 +781,10 @@ void RogControl::handleHotkey(uint32_t code, bool fromKeyboard) {
 	} else if (code == Rog::EventTouchpadToggle) {
 		setTouchpad(!touchpadEnabled);
 	} else if ((code == Rog::EventScreenDown || code == Rog::EventScreenUp) && screenSource != Rog::BacklightSourceEc) {
-		// The GPU drives the panel: let macOS do it, as for a Mac keyboard's brightness keys.
-		bool up = code == Rog::EventScreenUp;
-		if (keys && brightnessKeys == Rog::BrightnessKeysConsumer)
-			keys->press(kHIDPage_Consumer, up ? kHIDUsage_Csmr_DisplayBrightnessIncrement : kHIDUsage_Csmr_DisplayBrightnessDecrement);
-		else if (keys)
-			keys->press(kHIDPage_AppleVendorTopCase, up ? kHIDUsage_AV_TopCase_BrightnessUp : kHIDUsage_AV_TopCase_BrightnessDown);
+		// The GPU drives the panel: let macOS do it, as for any keyboard's brightness keys.
+		if (keys)
+			keys->press(kHIDPage_Consumer, code == Rog::EventScreenUp ?
+				kHIDUsage_Csmr_DisplayBrightnessIncrement : kHIDUsage_Csmr_DisplayBrightnessDecrement);
 	} else if ((code == Rog::EventScreenDown || code == Rog::EventScreenUp) && screenMax) {
 		uint32_t step = screenMax / Rog::ScreenSteps ? screenMax / Rog::ScreenSteps : 1;
 		uint32_t level = screenLevel;
@@ -852,15 +849,6 @@ IOReturn RogControl::setPropertiesGated(OSDictionary *dict) {
 	if (auto num = OSDynamicCast(OSNumber, dict->getObject("ScreenBrightness"))) {
 		auto level = num->unsigned32BitValue();
 		if (!setScreenLevel(level))
-			ret = kIOReturnBadArgument;
-	}
-
-	if (auto str = OSDynamicCast(OSString, dict->getObject("BrightnessKeys"))) {
-		if (str->isEqualTo("topcase"))
-			brightnessKeys = Rog::BrightnessKeysTopCase;
-		else if (str->isEqualTo("consumer"))
-			brightnessKeys = Rog::BrightnessKeysConsumer;
-		else
 			ret = kIOReturnBadArgument;
 	}
 

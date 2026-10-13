@@ -82,7 +82,6 @@ sudo rogctl fan 60 | auto                    # temporary, not saved
 sudo rogctl kbd 0..3                         # keyboard light (also Fn+F2/F3)
 sudo rogctl touchpad on|off                  # also Fn+F10
 sudo rogctl brightness 0..100                # also Fn+F7/F8
-sudo rogctl brightness keys topcase|consumer # what Fn+F7/F8 send to macOS
 rogctl events                                # what the kext did since boot
 sudo rogctl aura static ffffff               # or breathe a60000 000000, rainbow_cycle, rainbow_wave, pulse
 sudo rogctl aura zones ff0000 9b26b6 0000ff 007c80

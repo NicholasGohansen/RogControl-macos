@@ -88,9 +88,6 @@ namespace Rog {
 	constexpr uint32_t EventScreenDown = 0x10;       // Fn+F7
 	constexpr uint32_t EventScreenUp = 0x20;         // Fn+F8
 	constexpr uint32_t ScreenSteps = 16;             // like macOS brightness keys
-	// What Fn+F7/F8 send when the panel isn't on the EC backlight: Apple's top case brightness
-	// keys (what a Mac keyboard sends) or the HID consumer Display Brightness keys.
-	enum : uint8_t { BrightnessKeysTopCase, BrightnessKeysConsumer, BrightnessKeysCount };
 	// The firmware re-initialises things for a while after boot (the first keyboard light write
 	// is acknowledged and then lost), so stored settings are written again at these poll counts
 	// after the keyboard shows up / after the mode was restored.
@@ -217,7 +214,6 @@ class EXPORT RogControl : public IOService {
 	uint32_t screenLevel {0};
 	IOInterruptEventSource *hotkeySource {nullptr};
 	RogControlKeys *keys {nullptr};
-	uint8_t brightnessKeys {Rog::BrightnessKeysTopCase};
 	uint64_t lastHotkeyTime {0};
 	bool lastHotkeyFromKeyboard {false};
 	bool touchpadEnabled {true};

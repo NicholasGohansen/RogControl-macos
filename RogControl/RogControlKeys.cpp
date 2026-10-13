@@ -16,10 +16,9 @@ bool RogControlKeys::handleStart(IOService *provider) {
 	transport = OSString::withCString("ACPI");
 	product = OSString::withCString("RogControl Keys");
 	manufacturer = OSString::withCString("ASUSTeK");
-	// hidd treats a service as a keyboard (and its brightness keys as such) by its usage pairs.
-	auto pairs = OSArray::withCapacity(2);
+	// hidd goes by the usage pairs: consumer control (it acts on its brightness keys too).
+	auto pairs = OSArray::withCapacity(1);
 	static const uint32_t usages[][2] = {
-		{kHIDPage_GenericDesktop, kHIDUsage_GD_Keyboard},
 		{kHIDPage_Consumer, kHIDUsage_Csmr_ConsumerControl},
 	};
 	for (auto &u : usages) {
@@ -74,9 +73,9 @@ UInt32 RogControlKeys::getProductID() {
 }
 
 UInt32 RogControlKeys::getPrimaryUsagePage() {
-	return kHIDPage_GenericDesktop;
+	return kHIDPage_Consumer;
 }
 
 UInt32 RogControlKeys::getPrimaryUsage() {
-	return kHIDUsage_GD_Keyboard;
+	return kHIDUsage_Csmr_ConsumerControl;
 }

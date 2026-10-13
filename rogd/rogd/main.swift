@@ -209,7 +209,6 @@ final class Daemon {
 		if let level = state.keyboardLight ?? config.aura?.brightness.flatMap({ auraBrightness[$0] }), (0...3).contains(level) {
 			req["KeyboardBrightness"] = level
 		}
-		if let keys = state.brightnessKeys, ["topcase", "consumer"].contains(keys) { req["BrightnessKeys"] = keys }
 		if let level = state.screenBrightness, kext.properties()["ScreenBrightness"] != nil { req["ScreenBrightness"] = level }
 		guard !req.isEmpty else { return }
 		let ret = kext.set(req)
@@ -221,7 +220,6 @@ final class Daemon {
 		guard let props = kext?.properties() else { return }
 		var next = state
 		if let level = props["KeyboardBrightness"] as? Int { next.keyboardLight = level }
-		if let keys = props["BrightnessKeys"] as? String, keys != "unavailable" { next.brightnessKeys = keys }
 		if let level = props["ScreenBrightness"] as? Int { next.screenBrightness = level }
 		if next != state {
 			state = next

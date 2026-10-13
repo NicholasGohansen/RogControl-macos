@@ -19,7 +19,6 @@ usage: rogctl [status]                       fans, temperatures, profile, CPU/po
        rogctl kbd <0-3>                      keyboard backlight (also Fn+F2 / Fn+F3; 0 = off)
        rogctl touchpad on|off                (also Fn+F10)
        rogctl brightness <0-100>             screen brightness (also Fn+F7 / Fn+F8)
-       rogctl brightness keys topcase|consumer   what Fn+F7/F8 send to macOS (try the other if they do nothing)
        rogctl events                         what the kext did since boot (restores, keyboard, backlight)
        rogctl aura                           keyboard lighting settings
        rogctl aura <mode> [rrggbb] [rrggbb]  static|breathe|rainbow_cycle|rainbow_wave|pulse (also the Aura key)
@@ -86,7 +85,7 @@ func showStatus() {
 	if let level = num(p, "ScreenBrightness"), let max = num(p, "ScreenBrightnessMax") {
 		print("Screen brightness: \(level * 100 / Swift.max(max, 1))% (EC)")
 	} else if let value = panelBrightness() {
-		print("Screen brightness: \(Int((value * 100).rounded()))% (NVIDIA driver, keys: \(p["BrightnessKeys"] as? String ?? "?"))")
+		print("Screen brightness: \(Int((value * 100).rounded()))% (NVIDIA driver\(p["BrightnessKeys"] as? Bool == true ? "" : ", Fn+F7/F8 unavailable"))")
 	} else if num(p, "ScreenBrightnessSource") == 1 {
 		print("Screen brightness: no control (the NVIDIA driver registered no backlight; needs boot-arg nvrmacpibl=1)")
 	}
@@ -268,13 +267,6 @@ case "kbd":
 	if ret != KERN_SUCCESS { fail(String(format: "the keyboard did not take it (0x%x)", ret)) }
 	showStatus()
 case "brightness":
-	if args.count == 2, args[0] == "keys", ["topcase", "consumer"].contains(args[1]) {
-		let ret = kext.set(["BrightnessKeys": args[1]])
-		if ret == kIOReturnNotPrivileged { fail("permission denied, run with sudo") }
-		if ret != KERN_SUCCESS { fail(String(format: "the kext did not take it (0x%x)", ret)) }
-		print("Fn+F7/F8 now send \(args[1] == "topcase" ? "Apple keyboard" : "HID consumer") brightness keys")
-		exit(0)
-	}
 	guard args.count == 1, let pct = Int(args[0]), (0...100).contains(pct) else { fail("brightness needs 0-100") }
 	let props = kext.properties()
 	if num(props, "ScreenBrightness") != nil, let max = num(props, "ScreenBrightnessMax"), max > 0 {

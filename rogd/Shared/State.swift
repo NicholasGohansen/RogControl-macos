@@ -7,7 +7,6 @@ let statePath = "/Library/Application Support/RogControl/state.json"
 struct State: Codable, Equatable {
 	var profile: String?         // quiet / balanced / performance
 	var keyboardLight: Int?      // 0-3
-	var brightnessKeys: String?  // topcase / consumer
 	var screenBrightness: Int?   // EC backlight level (hybrid mode); otherwise macOS keeps its own
 
 	static func load(_ path: String = statePath) -> State {

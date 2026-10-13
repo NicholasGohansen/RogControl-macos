@@ -2,9 +2,10 @@
 //  RogControlKeys.hpp
 //  RogControl
 //
-//  A keyboard-like HID event service for keys that the N-KEY keyboard reports in its vendor
-//  report (0x5A) and macOS would never see: Fn+F7/F8 become the brightness keys Apple
-//  keyboards send, so macOS changes the panel brightness itself and shows its indicator.
+//  A consumer control HID event service (like a media key remote) for keys that the N-KEY
+//  keyboard reports in its vendor report (0x5A) and macOS would never see: Fn+F7/F8 become the
+//  consumer Display Brightness keys, so macOS changes the panel brightness and shows its
+//  indicator. Not a keyboard, so Keyboard Setup Assistant has nothing to identify.
 //
 
 #ifndef RogControlKeys_hpp
