@@ -1,5 +1,5 @@
 // rogd: applies RogControl profiles (the macOS counterpart of asusd).
-//   - at start, the profile of the mode the kext restored (the last one used, kept in NVRAM)
+//   - at start, the last profile used (kept by rogd and, as the mode, in NVRAM by the kext)
 //   - when the performance mode changes (Fn+F5, rogctl profile): that profile's curves, EPP, tunings
 //   - on AC <-> battery: the configured profile, or the other set of tunings
 //   - SIGHUP (sent by rogctl after editing the config): reload and apply again
@@ -45,10 +45,24 @@ func toggleMicMute() -> String {
 	return ret == noErr ? (muted == 1 ? "microphone muted" : "microphone unmuted") : "mute failed (\(ret))"
 }
 
+/// The last profile used, kept by rogd as well: the kext restores the mode from NVRAM, but this
+/// one also survives the firmware or NVRAM losing it.
+let lastProfilePath = "/Library/Application Support/RogControl/last-profile"
+
+func savedProfile() -> String? {
+	guard let text = try? String(contentsOfFile: lastProfilePath, encoding: .utf8) else { return nil }
+	let name = text.trimmingCharacters(in: .whitespacesAndNewlines)
+	return profileNames.contains(name) ? name : nil
+}
+
 final class Daemon {
 	var config = Config()
 	var kext: RogKext?
 	var lastMode: String?
+	/// A profile whose mode the kext refused (early in boot); retried, and not mistaken for a
+	/// mode change in the meantime.
+	var pendingProfile: String?
+	var pendingTries = 0
 	var lastOnBattery = onBatteryPower()
 	var notifyPort: IONotificationPortRef?
 	var hotkeyNotification: io_object_t = 0
@@ -108,8 +122,17 @@ final class Daemon {
 		let battery = onBatteryPower()
 		let req = filtered(profileRequest(config, profile: name, onBattery: battery, includeMode: setMode), kext.properties())
 		let ret = kext.set(req)
-		lastMode = kextMode(forProfile: name)
 		lastOnBattery = battery
+		if setMode && ret != KERN_SUCCESS && kextMode(forProfile: name) != kext.mode {
+			pendingProfile = pendingTries < 30 ? name : nil
+			pendingTries += 1
+			lastMode = kext.mode
+			log("\(name): the kext did not take the mode yet (0x\(String(ret, radix: 16))), \(pendingProfile == nil ? "giving up" : "retrying")")
+			return
+		}
+		pendingProfile = nil
+		lastMode = kextMode(forProfile: name)
+		if savedProfile() != name { try? "\(name)\n".write(toFile: lastProfilePath, atomically: true, encoding: .utf8) }
 		log("applied \(name) (\(reason), \(battery ? "battery" : "AC"))\(ret == KERN_SUCCESS ? "" : String(format: ", kext rejected a value (0x%x)", ret))")
 	}
 
@@ -136,11 +159,19 @@ final class Daemon {
 			if kext != nil {
 				log("RogControl.kext found")
 				listenForHotkeys()
-				applyCurrent(reason: "start")
+				if let saved = savedProfile(), kextMode(forProfile: saved) != kext?.mode {
+					apply(profile: saved, setMode: true, reason: "start, last used")
+				} else {
+					applyCurrent(reason: "start")
+				}
 			}
 			return
 		}
 		guard let mode = kext?.mode else { return }
+		if let pending = pendingProfile {
+			apply(profile: pending, setMode: true, reason: "start, last used (retry)")
+			return
+		}
 		if mode != lastMode, let name = profileName(forKextMode: mode) {
 			apply(profile: name, setMode: false, reason: "mode changed to \(mode)")
 		}

@@ -16,9 +16,19 @@ same ASUS WMI calls Linux `asus-wmi` makes (`\_SB.ATKD.WMNB`):
 - package power limits PL1/PL2/FPPT and NVIDIA dynamic boost / temperature target
   (the asusd "tunings")
 
+- the N-KEY keyboard's Fn keys, read from its vendor input report (0x5A) through a Lilu hook on
+  `IOHIDDevice::handleReportWithTime`, which also works while Karabiner-Elements holds the
+  keyboard: Fn+F2/F3 keyboard light, Fn+F5 mode, Fn+F7/F8 screen brightness, Fn+F10 touchpad
+  (VoodooI2C); the mic-mute key is handled by `rogd`
+- keyboard backlight (HID feature report, like Linux `hid-asus`)
+- screen brightness: with the MUX in dGPU mode the NVIDIA driver drives the panel, so Fn+F7/F8
+  are sent to macOS as brightness keys (needs the nullmoth NVIDIA driver with boot-arg
+  `nvrmacpibl=1`, which lets it read the panel's backlight table from ACPI and register the
+  panel as `AppleBacklightDisplay`); in hybrid mode the EC backlight (NVIDIA WMI method) is used
+
 - profiles applied by `rogd`, edited with `rogctl` (below)
 
-Planned: Fn keys, keyboard backlight and Aura lighting in rogd, menu-bar app.
+Planned: Aura lighting, menu-bar app.
 
 ## Requirements
 
@@ -44,8 +54,8 @@ counterpart of asusd) applies them:
 
 - one profile per performance mode: `quiet` (ASUS Silent), `balanced`, `performance` (Turbo),
   each with fan curves, a CPU energy preference (EPP) and power "tunings" for AC and battery
-- at start, when the mode changes (Fn+F5 or `rogctl profile`), and on AC <-> battery,
-  optionally switching profile with the power source (`auto_profile`)
+- at start (the last profile used), when the mode changes (Fn+F5 or `rogctl profile`), and on
+  AC <-> battery, optionally switching profile with the power source (`auto_profile`)
 - global CPU frequency cap and battery charge limit
 
 ```sh
@@ -63,6 +73,11 @@ sudo rogctl curve cpu 40:10,50:20,60:30,70:45,75:55,80:70,90:90,100:100
 sudo rogctl curve reset -p performance
 sudo rogctl charge 80
 sudo rogctl fan 60 | auto                    # temporary, not saved
+sudo rogctl kbd 0..3                         # keyboard light (also Fn+F2/F3)
+sudo rogctl touchpad on|off                  # also Fn+F10
+sudo rogctl brightness 0..100                # also Fn+F7/F8
+sudo rogctl brightness keys topcase|consumer # what Fn+F7/F8 send to macOS
+rogctl events                                # what the kext did since boot
 rogctl config
 ```
 
@@ -76,8 +91,8 @@ panel overdrive and Aura are kept in the config but not applied yet.
 
 ## Boot-args
 
-Mode and charge limit also persist in NVRAM. `rogmode=0|1|2` (balanced, turbo, silent),
+Mode, charge limit and keyboard light also persist in NVRAM. `rogmode=0|1|2` (balanced, turbo, silent),
 `rogcharge=N`, `rogcpumax=MHz` (0 = no cap) and `rogepp=0..255` work without rogd.
 `-rogcontrolnocppc` leaves the CPU alone. Custom curves never drop below 80% at 90 °C
 (`-rogcontrolnosafety` disables that). `-rogcontroloff` disables the kext,
-`-rogcontroldbg` enables debug logging.
+`-rogcontroldbg` enables debug logging, `-rogcontrolnohid` turns off the keyboard hook.

@@ -61,7 +61,7 @@ kflags=(
 )
 
 objects=()
-for src in RogControl/RogControl.cpp RogControl/KeyImplementations.cpp; do
+for src in RogControl/RogControl.cpp RogControl/RogControlKeys.cpp RogControl/KeyImplementations.cpp; do
     o="$obj/$(basename "$src" .cpp).o"
     echo "CXX $src"
     "$clangxx" "${kflags[@]}" "${opt[@]}" -std=gnu++20 -fapple-kext -fno-rtti -fno-exceptions -c "$here/$src" -o "$o"

@@ -11,6 +11,9 @@
 #include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/acpi/IOACPITypes.h>
 #include <kern/task.h>
+#include <kern/clock.h>
+#include <IOKit/hid/AppleHIDUsageTables.h>
+#include <IOKit/hid/IOHIDUsageTables.h>
 #include <pexpert/pexpert.h>
 #include <Headers/kern_version.hpp>
 #include <Headers/kern_api.hpp>
@@ -310,7 +313,8 @@ IOHIDDevice *RogControl::findKeyboard() {
 	OSSafeReleaseNULL(match);
 	if (kbd) {
 		atomic_store_explicit(&hookKeyboard, kbd, memory_order_release);
-		SYSLOG("rog", "N-KEY keyboard found, hotkey hook %s", orgHandleReportWithTime ? "active" : "not installed");
+		kbdFoundAt = pollCount;
+		note("keyboard found, hotkey hook %s", orgHandleReportWithTime ? "on" : "off");
 	}
 	return kbd;
 }
@@ -352,6 +356,7 @@ bool RogControl::writeKbdLevel(uint8_t level) {
 	if (!sendKbdReport(cmd, sizeof(cmd)))
 		return false;
 	kbdLevel = level;
+	kbdLevelKnown = true;
 	kbdPending = false;
 	return true;
 }
@@ -392,7 +397,8 @@ void RogControl::findBacklight() {
 		if (backlightCall(Rog::BacklightMethodLevel, Rog::BacklightGet, 0, v))
 			screenLevel = v;
 	}
-	SYSLOG("rog", "screen backlight: WMI %d, max %u, source %u, level %u", backlightWmi != nullptr, screenMax, screenSource, screenLevel);
+	note("screen backlight: WMI %d, max %u, source %s, level %u", backlightWmi != nullptr, screenMax,
+		screenSource == Rog::BacklightSourceEc ? "EC" : screenSource == Rog::BacklightSourceGpu ? "GPU" : "?", screenLevel);
 }
 
 bool RogControl::backlightCall(uint32_t method, uint32_t mode, uint32_t value, uint32_t &result) {
@@ -419,7 +425,7 @@ bool RogControl::backlightCall(uint32_t method, uint32_t mode, uint32_t value, u
 }
 
 bool RogControl::setScreenLevel(uint32_t level) {
-	if (!screenMax || level > screenMax)
+	if (!screenMax || screenSource != Rog::BacklightSourceEc || level > screenMax)
 		return false;
 	uint32_t ignored = 0;
 	if (!backlightCall(Rog::BacklightMethodLevel, Rog::BacklightSet, level, ignored))
@@ -609,7 +615,13 @@ void RogControl::loadNvramSettings() {
 	// Like Linux asus-wmi, start from a known policy (Balanced unless one was saved).
 	if (mode < 0 || mode >= Rog::PerfModeCount)
 		mode = Rog::PerfBalanced;
-	writePerfMode(static_cast<uint8_t>(mode));
+	if (writePerfMode(static_cast<uint8_t>(mode))) {
+		perfRestoredAt = pollCount;
+		note("mode %s restored", PerfModeNames[mode]);
+	} else {
+		perfRestore = mode;  // retried by the poller
+		note("mode %s not accepted yet, retrying", PerfModeNames[mode]);
+	}
 	if (charge >= 20 && charge <= 100)
 		writeChargeLimit(static_cast<uint8_t>(charge));
 
@@ -619,6 +631,9 @@ void RogControl::loadNvramSettings() {
 		auto b = OSDynamicCast(OSData, options->getProperty("rog-screen-light"));
 		if (b && b->getLength() == 1 && *static_cast<const uint8_t *>(b->getBytesNoCopy()) <= screenMax)
 			setScreenLevel(*static_cast<const uint8_t *>(b->getBytesNoCopy()));
+		auto k = OSDynamicCast(OSData, options->getProperty("rog-bl-keys"));
+		if (k && k->getLength() == 1 && *static_cast<const uint8_t *>(k->getBytesNoCopy()) < Rog::BrightnessKeysCount)
+			brightnessKeys = *static_cast<const uint8_t *>(k->getBytesNoCopy());
 		options->release();
 	}
 
@@ -628,7 +643,9 @@ void RogControl::loadNvramSettings() {
 		auto k = OSDynamicCast(OSData, options->getProperty("rog-kbd-light"));
 		if (k && k->getLength() == 1 && *static_cast<const uint8_t *>(k->getBytesNoCopy()) <= Rog::KbdMaxLevel) {
 			kbdLevel = *static_cast<const uint8_t *>(k->getBytesNoCopy());
+			kbdLevelKnown = true;
 			kbdPending = true;
+			note("keyboard light %u restored", kbdLevel);
 		}
 		options->release();
 	}
@@ -665,6 +682,20 @@ void RogControl::storeNvramData(const char *name, const void *bytes, size_t len)
 	options->release();
 }
 
+// Keeps the last few events (boot restore, keyboard, backlight) readable with `rogctl events`:
+// the kernel log loses kext messages early in boot.
+void RogControl::note(const char *format, ...) {
+	char *line = eventLog[eventCount % Rog::EventLogSize];
+	int used = snprintf(line, sizeof(eventLog[0]), "%4u s  ", pollCount);
+	va_list args;
+	va_start(args, format);
+	if (used > 0 && static_cast<size_t>(used) < sizeof(eventLog[0]))
+		vsnprintf(line + used, sizeof(eventLog[0]) - static_cast<size_t>(used), format, args);
+	va_end(args);
+	eventCount++;
+	SYSLOG("rog", "%s", line);
+}
+
 void RogControl::publishStatus() {
 	setProperty("CPU Fan RPM", atomic_load_explicit(&shared.rpm[0], memory_order_relaxed), 32);
 	setProperty("GPU Fan RPM", atomic_load_explicit(&shared.rpm[1], memory_order_relaxed), 32);
@@ -685,13 +716,26 @@ void RogControl::publishStatus() {
 	setProperty("KeyboardFound", kbd != nullptr && !kbd->isInactive());
 	setProperty("TouchpadEnabled", touchpadEnabled);
 	if (screenMax) {
-		setProperty("ScreenBrightness", screenLevel, 32);
+		if (screenSource == Rog::BacklightSourceEc)
+			setProperty("ScreenBrightness", screenLevel, 32);
 		setProperty("ScreenBrightnessMax", screenMax, 32);
 		setProperty("ScreenBrightnessSource", screenSource, 32);
 	}
 	setProperty("LastHotkey", lastHotkey, 32);
 	setProperty("HotkeyCount", hotkeyCount, 32);
 	setProperty("KeyboardHotkeyHook", orgHandleReportWithTime != 0);
+	setProperty("BrightnessKeys", keys ? (brightnessKeys == Rog::BrightnessKeysConsumer ? "consumer" : "topcase") : "unavailable");
+	if (auto log = OSArray::withCapacity(Rog::EventLogSize)) {
+		uint32_t first = eventCount > Rog::EventLogSize ? eventCount - static_cast<uint32_t>(Rog::EventLogSize) : 0;
+		for (uint32_t i = first; i < eventCount; i++) {
+			if (auto line = OSString::withCString(eventLog[i % Rog::EventLogSize])) {
+				log->setObject(line);
+				line->release();
+			}
+		}
+		setProperty("EventLog", log);
+		log->release();
+	}
 	setProperty("CPUMaxFrequencyMHz", cpuMaxMHz, 32);
 	setProperty("CPUEnergyPreference", cpuEpp, 32);
 	setProperty("CPUFrequencyLimitActive", cppcActive);
@@ -776,6 +820,13 @@ void RogControl::handleHotkey(uint32_t code, bool fromKeyboard) {
 			storeNvramByte("rog-kbd-light", level);
 	} else if (code == Rog::EventTouchpadToggle) {
 		setTouchpad(!touchpadEnabled);
+	} else if ((code == Rog::EventScreenDown || code == Rog::EventScreenUp) && screenSource != Rog::BacklightSourceEc) {
+		// The GPU drives the panel: let macOS do it, as for a Mac keyboard's brightness keys.
+		bool up = code == Rog::EventScreenUp;
+		if (keys && brightnessKeys == Rog::BrightnessKeysConsumer)
+			keys->press(kHIDPage_Consumer, up ? kHIDUsage_Csmr_DisplayBrightnessIncrement : kHIDUsage_Csmr_DisplayBrightnessDecrement);
+		else if (keys)
+			keys->press(kHIDPage_AppleVendorTopCase, up ? kHIDUsage_AV_TopCase_BrightnessUp : kHIDUsage_AV_TopCase_BrightnessDown);
 	} else if ((code == Rog::EventScreenDown || code == Rog::EventScreenUp) && screenMax) {
 		uint32_t step = screenMax / Rog::ScreenSteps ? screenMax / Rog::ScreenSteps : 1;
 		uint32_t level = screenLevel;
@@ -848,6 +899,17 @@ IOReturn RogControl::setPropertiesGated(OSDictionary *dict) {
 			ret = kIOReturnBadArgument;
 		else
 			storeNvramByte("rog-screen-light", static_cast<uint8_t>(level));
+	}
+
+	if (auto str = OSDynamicCast(OSString, dict->getObject("BrightnessKeys"))) {
+		if (str->isEqualTo("topcase"))
+			brightnessKeys = Rog::BrightnessKeysTopCase;
+		else if (str->isEqualTo("consumer"))
+			brightnessKeys = Rog::BrightnessKeysConsumer;
+		else
+			ret = kIOReturnBadArgument;
+		if (ret != kIOReturnBadArgument)
+			storeNvramByte("rog-bl-keys", brightnessKeys);
 	}
 
 	if (auto flag = OSDynamicCast(OSBoolean, dict->getObject("TouchpadEnabled"))) {
@@ -1076,13 +1138,40 @@ bool RogControl::start(IOService *provider) {
 			self->cpuDirty = false;
 			self->applyCpuLimit();
 		}
+		if (self->perfRestore >= 0) {
+			if (self->writePerfMode(static_cast<uint8_t>(self->perfRestore))) {
+				self->note("mode %s restored after %u tries", PerfModeNames[self->perfRestore], self->perfRestoreTries + 1);
+				self->perfRestore = -1;
+				self->perfRestoredAt = self->pollCount;
+			} else if (++self->perfRestoreTries >= Rog::PerfRestoreTries) {
+				self->note("mode %s never accepted", PerfModeNames[self->perfRestore]);
+				self->perfRestore = -1;
+			}
+		}
+		if (self->perfRestoredAt && self->perfModeKnown && self->pollCount - self->perfRestoredAt == Rog::PerfReassertPolls) {
+			bool ok = self->writePerfMode(self->perfMode);
+			self->note("mode %s written again: %s", PerfModeNames[self->perfMode], ok ? "ok" : "failed");
+		}
 		if (!self->kbd || self->kbd->isInactive())
 			self->findKeyboard();
+		if (self->kbd && self->kbdLevelKnown) {
+			for (auto at : Rog::KbdReassertPolls) {
+				if (self->pollCount - self->kbdFoundAt == at) {
+					self->kbdReady = false;
+					self->kbdPending = true;
+					self->kbdWaited = 0;
+				}
+			}
+		}
 		if (self->screenSaveIn && --self->screenSaveIn == 0)
 			self->storeNvramByte("rog-screen-light", static_cast<uint8_t>(self->screenLevel));
-		if (self->kbdPending) {
-			if (self->writeKbdLevel(self->kbdLevel) || ++self->kbdWaited > Rog::KbdRetrySeconds)
+		if (self->kbdPending && self->kbdLevelKnown) {
+			if (self->writeKbdLevel(self->kbdLevel)) {
+				self->note("keyboard light %u written", self->kbdLevel);
+			} else if (++self->kbdWaited > Rog::KbdRetrySeconds) {
+				self->note("keyboard light %u: keyboard not answering", self->kbdLevel);
 				self->kbdPending = false;
+			}
 		}
 		if ((self->pollCount++ % 2) == 0)
 			self->publishStatus();
@@ -1113,6 +1202,18 @@ bool RogControl::start(IOService *provider) {
 		SYSLOG("rog", "failed to register the VirtualSMC handler");
 		return false;
 	}
+
+	// Fn+F7/F8 as macOS brightness keys. Without it the keys just do nothing.
+	keys = OSTypeAlloc(RogControlKeys);
+	if (keys && keys->init() && keys->attach(this)) {
+		if (!keys->start(this)) {
+			keys->detach(this);
+			OSSafeReleaseNULL(keys);
+		}
+	} else {
+		OSSafeReleaseNULL(keys);
+	}
+	note("brightness keys %s", keys ? "ready" : "unavailable");
 
 	atomic_store_explicit(&hookSignal, hotkeySource, memory_order_release);
 	poller->setTimeoutMS(Rog::PollIntervalMS);
@@ -1148,7 +1249,7 @@ IOReturn RogControl::sleepHandler(void *target, void *refCon, UInt32 messageType
 			s->tunablesDirty = true;
 			s->cpuDirty = s->cppcActive;
 			s->kbdReady = false;
-			s->kbdPending = true;
+			s->kbdPending = s->kbdLevelKnown;
 			s->kbdWaited = 0;
 			return kIOReturnSuccess;
 		});

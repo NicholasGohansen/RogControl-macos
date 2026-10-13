@@ -20,6 +20,7 @@
 #include <IOKit/acpi/IOACPIPlatformDevice.h>
 #include <IOKit/pwr_mgt/RootDomain.h>
 #include <IOKit/hid/IOHIDDevice.h>
+#include "RogControlKeys.hpp"
 #include <stdatomic.h>
 
 #include <VirtualSMCSDK/kern_vsmcapi.hpp>
@@ -87,6 +88,16 @@ namespace Rog {
 	constexpr uint32_t EventScreenDown = 0x10;       // Fn+F7
 	constexpr uint32_t EventScreenUp = 0x20;         // Fn+F8
 	constexpr uint32_t ScreenSteps = 16;             // like macOS brightness keys
+	// What Fn+F7/F8 send when the panel isn't on the EC backlight: Apple's top case brightness
+	// keys (what a Mac keyboard sends) or the HID consumer Display Brightness keys.
+	enum : uint8_t { BrightnessKeysTopCase, BrightnessKeysConsumer, BrightnessKeysCount };
+	// The firmware re-initialises things for a while after boot (the first keyboard light write
+	// is acknowledged and then lost), so stored settings are written again at these poll counts
+	// after the keyboard shows up / after the mode was restored.
+	constexpr uint32_t KbdReassertPolls[] = {3, 10, 30, 60};
+	constexpr uint32_t PerfReassertPolls = 40;
+	constexpr uint32_t PerfRestoreTries = 60;
+	constexpr size_t EventLogSize = 24;
 
 	// VoodooI2C(HID) multitouch driver messages (the AsusSMC / VoodooPS2 convention), data is bool *
 	constexpr uint32_t MessageSetTouchStatus = iokit_vendor_specific_msg(100);
@@ -104,6 +115,9 @@ namespace Rog {
 		0xA3, 0xD0, 0xC4, 0x61, 0x77, 0x51, 0x6D, 0xB7};
 	constexpr uint32_t BacklightMethodLevel = 1, BacklightMethodSource = 2;
 	constexpr uint32_t BacklightGet = 0, BacklightSet = 1, BacklightGetMax = 2;
+	// Source 1 = the GPU drives the panel (MUX in dGPU mode: the NVIDIA driver does brightness),
+	// 2 = the EC does (WMAA level writes only work then).
+	constexpr uint32_t BacklightSourceGpu = 1, BacklightSourceEc = 2;
 	constexpr uint32_t BacklightSourceEC = 2;
 
 	// Every ATK hotkey is also sent to user-space clients (rogd) with this message, code in the argument.
@@ -187,12 +201,16 @@ class EXPORT RogControl : public IOService {
 	bool kbdPending {false};        // level still to be written (keyboard not up yet)
 	uint32_t kbdWaited {0};
 	uint8_t kbdLevel {Rog::KbdMaxLevel};
+	bool kbdLevelKnown {false};     // a level was saved or set; otherwise the keyboard is left alone
+	uint32_t kbdFoundAt {0};        // pollCount when this keyboard instance was found
 	IOACPIPlatformDevice *backlightWmi {nullptr};
 	uint32_t screenMax {0};          // 0 = no WMI EC backlight
 	uint32_t screenSource {0};
 	uint32_t screenLevel {0};
 	uint32_t screenSaveIn {0};       // polls until the level is written to NVRAM
 	IOInterruptEventSource *hotkeySource {nullptr};
+	RogControlKeys *keys {nullptr};
+	uint8_t brightnessKeys {Rog::BrightnessKeysTopCase};
 	uint64_t lastHotkeyTime {0};
 	bool lastHotkeyFromKeyboard {false};
 	bool touchpadEnabled {true};
@@ -218,6 +236,11 @@ class EXPORT RogControl : public IOService {
 	bool nvramLoaded {false};
 	uint8_t perfMode {Rog::PerfBalanced};
 	bool perfModeKnown {false};
+	int32_t perfRestore {-1};        // saved mode not yet accepted by the firmware
+	uint32_t perfRestoreTries {0};
+	uint32_t perfRestoredAt {0};     // pollCount of the restore, to write it once more later
+	char eventLog[Rog::EventLogSize][72] {};
+	uint32_t eventCount {0};
 	uint8_t chargeLimit {0};
 	RogFanCurve factoryCurve[Rog::PerfModeCount][Rog::MaxFans] {};
 	bool factoryCurveValid[Rog::PerfModeCount][Rog::MaxFans] {};
@@ -251,6 +274,7 @@ class EXPORT RogControl : public IOService {
 	void storeNvramByte(const char *name, uint8_t value);
 	void storeNvramData(const char *name, const void *bytes, size_t len);
 	void publishStatus();
+	void note(const char *format, ...) __printflike(2, 3);
 	void cyclePerfMode();
 
 	IOReturn setPropertiesGated(OSDictionary *dict);

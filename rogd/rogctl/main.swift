@@ -18,7 +18,9 @@ usage: rogctl [status]                       fans, temperatures, profile, CPU/po
        rogctl charge <20-100>                battery charge limit
        rogctl kbd <0-3>                      keyboard backlight (also Fn+F2 / Fn+F3; 0 = off)
        rogctl touchpad on|off                (also Fn+F10)
-       rogctl brightness <0-100>             screen brightness
+       rogctl brightness <0-100>             screen brightness (also Fn+F7 / Fn+F8)
+       rogctl brightness keys topcase|consumer   what Fn+F7/F8 send to macOS (try the other if they do nothing)
+       rogctl events                         what the kext did since boot (restores, keyboard, backlight)
        rogctl fan <0-100>|auto               force both fans now (not saved)
        rogctl config                         show the config file
 
@@ -77,7 +79,11 @@ func showStatus() {
 	print("GPU (NVIDIA)     : \(gpu.isEmpty ? "not supported" : gpu.joined(separator: ", "))")
 	if let charge = num(p, "ChargeLimit"), charge > 0 { print("Charge limit     : \(charge)%") }
 	if let level = num(p, "ScreenBrightness"), let max = num(p, "ScreenBrightnessMax") {
-		print("Screen brightness: \(level * 100 / Swift.max(max, 1))%")
+		print("Screen brightness: \(level * 100 / Swift.max(max, 1))% (EC)")
+	} else if let value = panelBrightness() {
+		print("Screen brightness: \(Int((value * 100).rounded()))% (NVIDIA driver, keys: \(p["BrightnessKeys"] as? String ?? "?"))")
+	} else if num(p, "ScreenBrightnessSource") == 1 {
+		print("Screen brightness: no control (the NVIDIA driver registered no backlight; needs boot-arg nvrmacpibl=1)")
 	}
 	if let touchpad = p["TouchpadEnabled"] as? Bool { print("Touchpad         : \(touchpad ? "on" : "off")") }
 	if let level = num(p, "KeyboardBrightness") {
@@ -254,13 +260,27 @@ case "kbd":
 	if ret != KERN_SUCCESS { fail(String(format: "the keyboard did not take it (0x%x)", ret)) }
 	showStatus()
 case "brightness":
-	let max = num(kext.properties(), "ScreenBrightnessMax") ?? 0
-	guard max > 0 else { fail("no screen backlight control found") }
+	if args.count == 2, args[0] == "keys", ["topcase", "consumer"].contains(args[1]) {
+		let ret = kext.set(["BrightnessKeys": args[1]])
+		if ret == kIOReturnNotPrivileged { fail("permission denied, run with sudo") }
+		if ret != KERN_SUCCESS { fail(String(format: "the kext did not take it (0x%x)", ret)) }
+		print("Fn+F7/F8 now send \(args[1] == "topcase" ? "Apple keyboard" : "HID consumer") brightness keys")
+		exit(0)
+	}
 	guard args.count == 1, let pct = Int(args[0]), (0...100).contains(pct) else { fail("brightness needs 0-100") }
-	let ret = kext.set(["ScreenBrightness": pct * max / 100])
-	if ret == kIOReturnNotPrivileged { fail("permission denied, run with sudo") }
-	if ret != KERN_SUCCESS { fail(String(format: "the backlight did not take it (0x%x)", ret)) }
+	let props = kext.properties()
+	if num(props, "ScreenBrightness") != nil, let max = num(props, "ScreenBrightnessMax"), max > 0 {
+		let ret = kext.set(["ScreenBrightness": pct * max / 100])
+		if ret == kIOReturnNotPrivileged { fail("permission denied, run with sudo") }
+		if ret != KERN_SUCCESS { fail(String(format: "the backlight did not take it (0x%x)", ret)) }
+	} else if panelBrightness() != nil {
+		guard setPanelBrightness(Float(pct) / 100) else { fail("macOS refused the brightness change") }
+	} else {
+		fail("no screen backlight control (the NVIDIA driver registered no backlight; needs boot-arg nvrmacpibl=1)")
+	}
 	showStatus()
+case "events":
+	for line in kext.properties()["EventLog"] as? [String] ?? [] { print(line) }
 case "touchpad":
 	guard args == ["on"] || args == ["off"] else { fail("touchpad needs on or off") }
 	let ret = kext.set(["TouchpadEnabled": args[0] == "on"])
