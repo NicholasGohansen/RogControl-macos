@@ -106,6 +106,10 @@ namespace Rog {
 	// N-KEY USB keyboard (Linux hid-asus): feature report 0x5A
 	constexpr uint32_t AsusVendorID = 0x0B05;
 	constexpr uint8_t KbdReportID = 0x5A;
+	// Aura lighting: output report 0x5D (asusd writes it padded to the 64-byte report size),
+	// after a feature report "]ASUS Tech.Inc." like hid-asus sends at probe.
+	constexpr uint8_t AuraReportID = 0x5D;
+	constexpr unsigned AuraMaxReports = 16;
 	constexpr uint8_t KbdMaxLevel = 3;
 	constexpr uint32_t KbdRetrySeconds = 180;
 
@@ -202,6 +206,10 @@ class EXPORT RogControl : public IOService {
 	uint32_t kbdWaited {0};
 	uint8_t kbdLevel {Rog::KbdMaxLevel};
 	bool kbdLevelKnown {false};     // a level was saved or set; otherwise the keyboard is left alone
+	OSArray *auraReports {nullptr}; // last Aura packets from rogd (OSData, report ID first)
+	bool auraReady {false};         // LED handshake sent to this keyboard instance
+	bool auraPending {false};       // packets still to be sent (keyboard not up yet)
+	uint32_t auraWaited {0};
 	uint32_t kbdFoundAt {0};        // pollCount when this keyboard instance was found
 	IOACPIPlatformDevice *backlightWmi {nullptr};
 	uint32_t screenMax {0};          // 0 = no WMI EC backlight
@@ -258,7 +266,8 @@ class EXPORT RogControl : public IOService {
 	bool writeChargeLimit(uint8_t limit);
 	void writeTunables();
 	IOHIDDevice *findKeyboard();
-	bool sendKbdReport(const uint8_t *bytes, size_t len);
+	bool sendKbdReport(const uint8_t *bytes, size_t len, IOHIDReportType type = kIOHIDReportTypeFeature);
+	bool sendAuraReports();
 	bool writeKbdLevel(uint8_t level);
 	bool setTouchpad(bool enable);
 	void findBacklight();

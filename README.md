@@ -26,9 +26,13 @@ same ASUS WMI calls Linux `asus-wmi` makes (`\_SB.ATKD.WMNB`):
   `nvrmacpibl=1`, which lets it read the panel's backlight table from ACPI and register the
   panel as `AppleBacklightDisplay`); in hybrid mode the EC backlight (NVIDIA WMI method) is used
 
+- Aura keyboard lighting (static, breathe, rainbow cycle/wave, pulse; one colour or four
+  zones; which lights stay on at boot/awake/sleep/shutdown), with the packets asusd sends;
+  the Aura key cycles the modes
+
 - profiles applied by `rogd`, edited with `rogctl` (below)
 
-Planned: Aura lighting, menu-bar app.
+Planned: menu-bar app.
 
 ## Requirements
 
@@ -80,6 +84,10 @@ sudo rogctl touchpad on|off                  # also Fn+F10
 sudo rogctl brightness 0..100                # also Fn+F7/F8
 sudo rogctl brightness keys topcase|consumer # what Fn+F7/F8 send to macOS
 rogctl events                                # what the kext did since boot
+sudo rogctl aura static ffffff               # or breathe a60000 000000, rainbow_cycle, rainbow_wave, pulse
+sudo rogctl aura zones ff0000 9b26b6 0000ff 007c80
+sudo rogctl aura speed high | direction left
+sudo rogctl aura power lightbar off sleep    # keyboard|lightbar|all on|off [boot|awake|sleep|shutdown]
 rogctl config
 ```
 
@@ -88,8 +96,9 @@ rogctl config
 `tools/import-asusd.py DIR > config.json` converts copies of `/etc/asusd/asusd.ron`,
 `fan_curves.ron`, `aura_*.ron` and any systemd units running `cpupower frequency-set -u` or
 `nvidia-smi -lgc` into a config: fan curves (pwm to percent like asus-wmi), linked EPP,
-AC/DC tunings, profile switching on AC/battery, charge limit, CPU cap. GPU clock locks,
-panel overdrive and Aura are kept in the config but not applied yet.
+AC/DC tunings, profile switching on AC/battery, charge limit, CPU cap, Aura mode, colours,
+zones and power states. GPU clock locks and panel overdrive are kept in the config but not
+applied yet.
 
 ## Boot-args
 

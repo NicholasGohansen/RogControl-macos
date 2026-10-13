@@ -21,6 +21,11 @@ usage: rogctl [status]                       fans, temperatures, profile, CPU/po
        rogctl brightness <0-100>             screen brightness (also Fn+F7 / Fn+F8)
        rogctl brightness keys topcase|consumer   what Fn+F7/F8 send to macOS (try the other if they do nothing)
        rogctl events                         what the kext did since boot (restores, keyboard, backlight)
+       rogctl aura                           keyboard lighting settings
+       rogctl aura <mode> [rrggbb] [rrggbb]  static|breathe|rainbow_cycle|rainbow_wave|pulse (also the Aura key)
+       rogctl aura speed low|med|high | direction right|left|up|down
+       rogctl aura zones rrggbb rrggbb rrggbb rrggbb | zones off    four keyboard zones, left to right
+       rogctl aura power keyboard|lightbar|all on|off [boot|awake|sleep|shutdown]
        rogctl fan <0-100>|auto               force both fans now (not saved)
        rogctl config                         show the config file
 
@@ -282,6 +287,74 @@ case "brightness":
 		fail("no screen backlight control (the NVIDIA driver registered no backlight; needs boot-arg nvrmacpibl=1)")
 	}
 	showStatus()
+case "aura":
+	var config = (try? Config.load()) ?? Config()
+	var aura = config.aura ?? Aura()
+	func show(_ a: Aura) {
+		let p = a.power ?? AuraPower()
+		func states(_ s: AuraPowerState) -> String {
+			let on = [("boot", s.boot), ("awake", s.awake), ("sleep", s.sleep), ("shutdown", s.shutdown)].filter { $0.1 }.map { $0.0 }
+			return on.isEmpty ? "off" : on.joined(separator: ", ")
+		}
+		print("Mode       : \(a.mode ?? "(not set: the keyboard keeps its own)")")
+		if let zones = a.zones { print("Zones      : \(zones.joined(separator: " "))") } else { print("Colour     : \(a.colour ?? "ffffff")\(a.colour2.map { ", second \($0)" } ?? "")") }
+		print("Speed      : \(a.speed ?? "med"), direction \(a.direction ?? "right")")
+		print("Brightness : \(a.brightness ?? "-") (default keyboard light; Fn+F2/F3 change it)")
+		print("Keyboard   : \(states(p.keyboard))")
+		print("Lightbar   : \(states(p.lightbar))")
+	}
+	if args.isEmpty { show(aura); exit(0) }
+	switch args[0] {
+	case "speed":
+		guard args.count == 2, auraSpeeds[args[1]] != nil else { fail("speed is low, med or high") }
+		aura.speed = args[1]
+	case "direction":
+		guard args.count == 2, auraDirections[args[1]] != nil else { fail("direction is right, left, up or down") }
+		aura.direction = args[1]
+	case "zones":
+		if args == ["zones", "off"] {
+			aura.zones = nil
+		} else {
+			guard args.count == 5, args[1...].allSatisfy({ rgb($0) != nil }) else { fail("zones needs 4 colours rrggbb") }
+			aura.zones = Array(args[1...])
+		}
+	case "power":
+		guard args.count >= 3, ["keyboard", "lightbar", "all"].contains(args[1]), ["on", "off"].contains(args[2]) else { fail(usage, code: 2) }
+		let on = args[2] == "on"
+		let which = args.count > 3 ? Array(args[3...]) : ["boot", "awake", "sleep", "shutdown"]
+		guard which.allSatisfy({ ["boot", "awake", "sleep", "shutdown"].contains($0) }) else { fail("states are boot, awake, sleep, shutdown") }
+		var power = aura.power ?? AuraPower()
+		func update(_ s: inout AuraPowerState) {
+			for w in which {
+				switch w {
+				case "boot": s.boot = on
+				case "awake": s.awake = on
+				case "sleep": s.sleep = on
+				default: s.shutdown = on
+				}
+			}
+		}
+		if args[1] != "lightbar" { update(&power.keyboard) }
+		if args[1] != "keyboard" { update(&power.lightbar) }
+		aura.power = power
+	default:
+		guard auraModes[args[0]] != nil, args.count <= 3 else { fail("unknown aura mode \(args[0]); modes: \(auraCycle.joined(separator: ", "))") }
+		aura.mode = args[0]
+		if args.count > 1 { guard rgb(args[1]) != nil else { fail("colour must be rrggbb") }; aura.colour = args[1].lowercased() }
+		if args.count > 2 { guard rgb(args[2]) != nil else { fail("colour must be rrggbb") }; aura.colour2 = args[2].lowercased() }
+	}
+	guard aura.problems.isEmpty else { fail(aura.problems.joined(separator: "; ")) }
+	config.aura = aura
+	do { try config.save() } catch { fail("cannot write \(configPath) (\(error.localizedDescription)); run with sudo") }
+	if let pidText = try? String(contentsOfFile: pidPath, encoding: .utf8),
+		let pid = pid_t(pidText.trimmingCharacters(in: .whitespacesAndNewlines)), kill(pid, SIGHUP) == 0 {
+		usleep(600_000)
+	} else {
+		let ret = kext.set(["AuraReports": aura.packets()])
+		if ret == kIOReturnNotPrivileged { fail("permission denied, run with sudo") }
+		print("(rogd is not running: sent directly)")
+	}
+	show(aura)
 case "events":
 	for line in kext.properties()["EventLog"] as? [String] ?? [] { print(line) }
 case "touchpad":

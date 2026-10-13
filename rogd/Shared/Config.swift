@@ -48,11 +48,6 @@ struct AutoProfile: Codable, Equatable {
 	var onBattery: String?
 }
 
-struct Aura: Codable, Equatable {
-	var mode: String?
-	var colour: String?
-	var brightness: String?
-}
 
 struct Config: Codable, Equatable {
 	var version = 1
@@ -62,7 +57,7 @@ struct Config: Codable, Equatable {
 	var panelOverdrive: Bool?   // not applied yet
 	var autoProfile: AutoProfile?
 	var profiles: [String: Profile] = [:]
-	var aura: Aura?             // not applied yet
+	var aura: Aura?             // keyboard lighting (Aura.swift)
 
 	static func load(_ path: String = configPath) throws -> Config {
 		guard FileManager.default.fileExists(atPath: path) else { return Config() }

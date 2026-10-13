@@ -48,6 +48,7 @@ func toggleMicMute() -> String {
 final class Daemon {
 	var config = Config()
 	var state = State.load()
+	var appliedAura: Aura?
 	var kext: RogKext?
 	var lastMode: String?
 	/// A profile whose mode the kext refused (early in boot); retried, and not mistaken for a
@@ -78,7 +79,7 @@ final class Daemon {
 		case .rogKey:
 			log("ROG key pressed (not assigned yet)")
 		case .auraKey:
-			log("Aura key pressed (not assigned yet)")
+			cycleAura()
 		case nil:
 			break
 		}
@@ -152,6 +153,7 @@ final class Daemon {
 				log("RogControl.kext found")
 				listenForHotkeys()
 				restoreState()
+				applyAura(reason: "start")
 				if let saved = state.profile, profileNames.contains(saved), kextMode(forProfile: saved) != kext?.mode {
 					apply(profile: saved, setMode: true, reason: "start, last used")
 				} else {
@@ -171,6 +173,30 @@ final class Daemon {
 		}
 	}
 
+	/// Sends the Aura settings when they differ from what was last sent (APPLY writes the
+	/// keyboard's own storage, so not on every config reload).
+	func applyAura(reason: String) {
+		guard let kext = kext, let aura = config.aura, aura.mode != nil || aura.zones != nil, aura != appliedAura else { return }
+		guard aura.problems.isEmpty else {
+			log("aura not applied: \(aura.problems.joined(separator: ", "))")
+			return
+		}
+		let ret = kext.set(["AuraReports": aura.packets()])
+		appliedAura = aura
+		let what = aura.zones != nil ? "zones \(aura.zones!.joined(separator: " "))" : (aura.colour ?? "")
+		log("aura \(aura.mode ?? "static") \(what) (\(reason))\(ret == KERN_SUCCESS ? "" : String(format: ", kext: 0x%x", ret))")
+	}
+
+	/// The Aura key: next mode, like asusd.
+	func cycleAura() {
+		var aura = config.aura ?? Aura()
+		let current = auraCycle.firstIndex(of: aura.mode ?? "static") ?? -1
+		aura.mode = auraCycle[(current + 1) % auraCycle.count]
+		config.aura = aura
+		do { try config.save() } catch { log("could not save the Aura mode: \(error)") }
+		applyAura(reason: "Aura key")
+	}
+
 	func saveState() {
 		do { try state.save() } catch { log("could not save \(statePath): \(error)") }
 	}
@@ -180,7 +206,9 @@ final class Daemon {
 	func restoreState() {
 		guard let kext = kext else { return }
 		var req: [String: Any] = [:]
-		if let level = state.keyboardLight, (0...3).contains(level) { req["KeyboardBrightness"] = level }
+		if let level = state.keyboardLight ?? config.aura?.brightness.flatMap({ auraBrightness[$0] }), (0...3).contains(level) {
+			req["KeyboardBrightness"] = level
+		}
 		if let keys = state.brightnessKeys, ["topcase", "consumer"].contains(keys) { req["BrightnessKeys"] = keys }
 		if let level = state.screenBrightness, kext.properties()["ScreenBrightness"] != nil { req["ScreenBrightness"] = level }
 		guard !req.isEmpty else { return }
@@ -222,6 +250,7 @@ let hup = DispatchSource.makeSignalSource(signal: SIGHUP, queue: .main)
 hup.setEventHandler {
 	daemon.loadConfig()
 	daemon.applyCurrent(reason: "config reloaded")
+	daemon.applyAura(reason: "config reloaded")
 }
 hup.resume()
 

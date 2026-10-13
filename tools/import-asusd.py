@@ -161,9 +161,24 @@ def main():
         aura = load_ron(path)
         mode = aura.get("current_mode")
         effect = (aura.get("builtins") or {}).get(mode) or {}
-        c = effect.get("colour1") or {}
-        cfg["aura"] = {"mode": str(mode).lower(), "brightness": str(aura.get("brightness", "")).lower(),
-                       "colour": "%02x%02x%02x" % (c.get("r", 0), c.get("g", 0), c.get("b", 0))}
+        hexc = lambda c: "%02x%02x%02x" % (c.get("r", 0), c.get("g", 0), c.get("b", 0))
+        names = {"RainbowCycle": "rainbow_cycle", "RainbowWave": "rainbow_wave", "Stars": "star"}
+        out = {"mode": names.get(str(mode), str(mode).lower()), "brightness": str(aura.get("brightness", "")).lower(),
+               "colour": hexc(effect.get("colour1") or {}),
+               "speed": str(effect.get("speed", "Med")).lower(), "direction": str(effect.get("direction", "Right")).lower()}
+        if mode == "Breathe":
+            out["colour2"] = hexc(effect.get("colour2") or {})
+        zones = ((aura.get("multizone") or {}).get(mode) or []) if aura.get("multizone_on") else []
+        if len(zones) == 4:
+            out["zones"] = [hexc(z.get("colour1") or {}) for z in zones]
+        power = {}
+        for st in ((aura.get("enabled") or {}).get("states") or []):
+            zone = str(st.get("zone", "")).lower()
+            if zone in ("keyboard", "lightbar"):
+                power[zone] = {k: bool(st.get(k, True)) for k in ("boot", "awake", "sleep", "shutdown")}
+        if power:
+            out["power"] = power
+        cfg["aura"] = out
 
     json.dump(cfg, sys.stdout, indent=2, sort_keys=True)
     print()

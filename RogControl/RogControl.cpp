@@ -285,6 +285,7 @@ IOHIDDevice *RogControl::findKeyboard() {
 	atomic_store_explicit(&hookKeyboard, static_cast<IOHIDDevice *>(nullptr), memory_order_release);
 	OSSafeReleaseNULL(kbd);
 	kbdReady = false;
+	auraReady = false;
 
 	// The N-KEY keyboard is served by a DriverKit HID driver that starts after launchd,
 	// so it shows up some seconds after this kext.
@@ -319,12 +320,12 @@ IOHIDDevice *RogControl::findKeyboard() {
 	return kbd;
 }
 
-bool RogControl::sendKbdReport(const uint8_t *bytes, size_t len) {
+bool RogControl::sendKbdReport(const uint8_t *bytes, size_t len, IOHIDReportType type) {
 	auto dev = findKeyboard();
 	if (!dev)
 		return false;
-	auto feature = OSDynamicCast(OSNumber, dev->getProperty("MaxFeatureReportSize"));
-	size_t size = feature ? feature->unsigned32BitValue() : 64;
+	auto max = OSDynamicCast(OSNumber, dev->getProperty(type == kIOHIDReportTypeOutput ? "MaxOutputReportSize" : "MaxFeatureReportSize"));
+	size_t size = max ? max->unsigned32BitValue() : 64;
 	if (len > size)
 		return false;
 	// The buffer starts with the report ID, like Linux hid_hw_raw_request().
@@ -334,7 +335,7 @@ bool RogControl::sendKbdReport(const uint8_t *bytes, size_t len) {
 	memset(md->getBytesNoCopy(), 0, size);
 	lilu_os_memcpy(md->getBytesNoCopy(), bytes, len);
 	md->setLength(size);
-	IOReturn ret = dev->setReport(md, kIOHIDReportTypeFeature, bytes[0]);
+	IOReturn ret = dev->setReport(md, type, bytes[0]);
 	md->release();
 	if (ret != kIOReturnSuccess)
 		SYSLOG("rog", "keyboard report %02X %02X failed %08X", bytes[0], len > 1 ? bytes[1] : 0, ret);
@@ -358,6 +359,25 @@ bool RogControl::writeKbdLevel(uint8_t level) {
 	kbdLevel = level;
 	kbdLevelKnown = true;
 	kbdPending = false;
+	return true;
+}
+
+bool RogControl::sendAuraReports() {
+	if (!auraReports)
+		return true;
+	if (!auraReady) {
+		static const uint8_t init[] = {Rog::AuraReportID, 'A', 'S', 'U', 'S', ' ', 'T', 'e', 'c', 'h', '.', 'I', 'n', 'c', '.', 0};
+		if (!sendKbdReport(init, sizeof(init)))
+			return false;
+		auraReady = true;
+	}
+	for (unsigned i = 0; i < auraReports->getCount(); i++) {
+		auto data = OSDynamicCast(OSData, auraReports->getObject(i));
+		if (!data || !sendKbdReport(static_cast<const uint8_t *>(data->getBytesNoCopy()), data->getLength(), kIOHIDReportTypeOutput))
+			return false;
+	}
+	note("aura: %u packets sent", auraReports->getCount());
+	auraPending = false;
 	return true;
 }
 
@@ -844,6 +864,30 @@ IOReturn RogControl::setPropertiesGated(OSDictionary *dict) {
 			ret = kIOReturnBadArgument;
 	}
 
+	// Aura: rogd builds the packets (effect, SET, APPLY, power states) like asusd does.
+	if (auto list = OSDynamicCast(OSArray, dict->getObject("AuraReports"))) {
+		bool valid = list->getCount() > 0 && list->getCount() <= Rog::AuraMaxReports;
+		for (unsigned i = 0; valid && i < list->getCount(); i++) {
+			auto data = OSDynamicCast(OSData, list->getObject(i));
+			valid = data && data->getLength() >= 2 && data->getLength() <= 64 &&
+				static_cast<const uint8_t *>(data->getBytesNoCopy())[0] == Rog::AuraReportID;
+		}
+		if (!valid) {
+			ret = kIOReturnBadArgument;
+		} else {
+			OSSafeReleaseNULL(auraReports);
+			auraReports = OSArray::withArray(list);
+			if (!sendAuraReports()) {
+				if (kbd && !kbd->isInactive())
+					ret = kIOReturnNotResponding;
+				else {
+					auraPending = true;  // sent once the keyboard's driver is up
+					auraWaited = 0;
+				}
+			}
+		}
+	}
+
 	if (auto flag = OSDynamicCast(OSBoolean, dict->getObject("TouchpadEnabled"))) {
 		if (!setTouchpad(flag->isTrue()))
 			ret = kIOReturnNotFound;
@@ -1104,6 +1148,10 @@ bool RogControl::start(IOService *provider) {
 					self->kbdWaited = 0;
 				}
 			}
+		}
+		if (self->auraPending && self->kbd && !self->sendAuraReports() && ++self->auraWaited > Rog::KbdRetrySeconds) {
+			self->note("aura: keyboard not answering");
+			self->auraPending = false;
 		}
 		if (self->kbdPending && self->kbdLevelKnown) {
 			if (self->writeKbdLevel(self->kbdLevel)) {
