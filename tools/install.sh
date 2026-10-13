@@ -12,6 +12,9 @@ if [ $# -ge 1 ]; then
 	install -m 644 "$1" "/Library/Application Support/RogControl/config.json"
 	echo "installed config from $1"
 fi
+# The kext's brightness-key device (Fn+F7/F8) is a keyboard to macOS; without a keyboard type
+# for it (vendor 0x0B05, product 0) Keyboard Setup Assistant asks to identify it at every boot.
+defaults write /Library/Preferences/com.apple.keyboardtype keyboardtype -dict-add "0-2821-0" -int 40
 plist=/Library/LaunchDaemons/com.pengubow.rogd.plist
 launchctl bootout system/com.pengubow.rogd 2>/dev/null || true
 install -m 644 -o root -g wheel "$here/rogd/com.pengubow.rogd.plist" "$plist"
