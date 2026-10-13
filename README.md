@@ -54,8 +54,10 @@ counterpart of asusd) applies them:
 
 - one profile per performance mode: `quiet` (ASUS Silent), `balanced`, `performance` (Turbo),
   each with fan curves, a CPU energy preference (EPP) and power "tunings" for AC and battery
-- at start (the last profile used), when the mode changes (Fn+F5 or `rogctl profile`), and on
-  AC <-> battery, optionally switching profile with the power source (`auto_profile`)
+- at start: the last profile used, keyboard light and brightness key style, kept in
+  `state.json` next to the config (the kext itself changes nothing at boot)
+- when the mode changes (Fn+F5 or `rogctl profile`), and on AC <-> battery, optionally
+  switching profile with the power source (`auto_profile`)
 - global CPU frequency cap and battery charge limit
 
 ```sh
@@ -91,8 +93,8 @@ panel overdrive and Aura are kept in the config but not applied yet.
 
 ## Boot-args
 
-Mode, charge limit and keyboard light also persist in NVRAM. `rogmode=0|1|2` (balanced, turbo, silent),
-`rogcharge=N`, `rogcpumax=MHz` (0 = no cap) and `rogepp=0..255` work without rogd.
+Without rogd the kext leaves the firmware as it is; `rogmode=0|1|2` (balanced, turbo, silent),
+`rogcharge=N`, `rogcpumax=MHz` (0 = no cap) and `rogepp=0..255` apply settings at boot.
 `-rogcontrolnocppc` leaves the CPU alone. Custom curves never drop below 80% at 90 °C
 (`-rogcontrolnosafety` disables that). `-rogcontroloff` disables the kext,
 `-rogcontroldbg` enables debug logging, `-rogcontrolnohid` turns off the keyboard hook.

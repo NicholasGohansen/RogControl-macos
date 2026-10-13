@@ -1,5 +1,5 @@
 // rogd: applies RogControl profiles (the macOS counterpart of asusd).
-//   - at start, the last profile used (kept by rogd and, as the mode, in NVRAM by the kext)
+//   - at start, the last profile used and the keyboard light (kept in state.json)
 //   - when the performance mode changes (Fn+F5, rogctl profile): that profile's curves, EPP, tunings
 //   - on AC <-> battery: the configured profile, or the other set of tunings
 //   - SIGHUP (sent by rogctl after editing the config): reload and apply again
@@ -45,18 +45,9 @@ func toggleMicMute() -> String {
 	return ret == noErr ? (muted == 1 ? "microphone muted" : "microphone unmuted") : "mute failed (\(ret))"
 }
 
-/// The last profile used, kept by rogd as well: the kext restores the mode from NVRAM, but this
-/// one also survives the firmware or NVRAM losing it.
-let lastProfilePath = "/Library/Application Support/RogControl/last-profile"
-
-func savedProfile() -> String? {
-	guard let text = try? String(contentsOfFile: lastProfilePath, encoding: .utf8) else { return nil }
-	let name = text.trimmingCharacters(in: .whitespacesAndNewlines)
-	return profileNames.contains(name) ? name : nil
-}
-
 final class Daemon {
 	var config = Config()
+	var state = State.load()
 	var kext: RogKext?
 	var lastMode: String?
 	/// A profile whose mode the kext refused (early in boot); retried, and not mistaken for a
@@ -132,7 +123,8 @@ final class Daemon {
 		}
 		pendingProfile = nil
 		lastMode = kextMode(forProfile: name)
-		if savedProfile() != name { try? "\(name)\n".write(toFile: lastProfilePath, atomically: true, encoding: .utf8) }
+		state.profile = name
+		saveState()
 		log("applied \(name) (\(reason), \(battery ? "battery" : "AC"))\(ret == KERN_SUCCESS ? "" : String(format: ", kext rejected a value (0x%x)", ret))")
 	}
 
@@ -159,7 +151,8 @@ final class Daemon {
 			if kext != nil {
 				log("RogControl.kext found")
 				listenForHotkeys()
-				if let saved = savedProfile(), kextMode(forProfile: saved) != kext?.mode {
+				restoreState()
+				if let saved = state.profile, profileNames.contains(saved), kextMode(forProfile: saved) != kext?.mode {
 					apply(profile: saved, setMode: true, reason: "start, last used")
 				} else {
 					applyCurrent(reason: "start")
@@ -172,8 +165,39 @@ final class Daemon {
 			apply(profile: pending, setMode: true, reason: "start, last used (retry)")
 			return
 		}
+		recordState()
 		if mode != lastMode, let name = profileName(forKextMode: mode) {
 			apply(profile: name, setMode: false, reason: "mode changed to \(mode)")
+		}
+	}
+
+	func saveState() {
+		do { try state.save() } catch { log("could not save \(statePath): \(error)") }
+	}
+
+	/// Puts back what the user last chose that isn't part of a profile (the keyboard light comes
+	/// up dark and the kext waits for its driver before writing it).
+	func restoreState() {
+		guard let kext = kext else { return }
+		var req: [String: Any] = [:]
+		if let level = state.keyboardLight, (0...3).contains(level) { req["KeyboardBrightness"] = level }
+		if let keys = state.brightnessKeys, ["topcase", "consumer"].contains(keys) { req["BrightnessKeys"] = keys }
+		if let level = state.screenBrightness, kext.properties()["ScreenBrightness"] != nil { req["ScreenBrightness"] = level }
+		guard !req.isEmpty else { return }
+		let ret = kext.set(req)
+		log("restored \(req.keys.sorted().joined(separator: ", "))\(ret == KERN_SUCCESS ? "" : String(format: " (kext: 0x%x)", ret))")
+	}
+
+	/// Remembers changes made with the keys (Fn+F2/F3, Fn+F7/F8) or rogctl.
+	func recordState() {
+		guard let props = kext?.properties() else { return }
+		var next = state
+		if let level = props["KeyboardBrightness"] as? Int { next.keyboardLight = level }
+		if let keys = props["BrightnessKeys"] as? String, keys != "unavailable" { next.brightnessKeys = keys }
+		if let level = props["ScreenBrightness"] as? Int { next.screenBrightness = level }
+		if next != state {
+			state = next
+			saveState()
 		}
 	}
 

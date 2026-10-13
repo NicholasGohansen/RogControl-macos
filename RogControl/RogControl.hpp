@@ -207,7 +207,6 @@ class EXPORT RogControl : public IOService {
 	uint32_t screenMax {0};          // 0 = no WMI EC backlight
 	uint32_t screenSource {0};
 	uint32_t screenLevel {0};
-	uint32_t screenSaveIn {0};       // polls until the level is written to NVRAM
 	IOInterruptEventSource *hotkeySource {nullptr};
 	RogControlKeys *keys {nullptr};
 	uint8_t brightnessKeys {Rog::BrightnessKeysTopCase};
@@ -233,7 +232,7 @@ class EXPORT RogControl : public IOService {
 	uint32_t cppcCores {0};
 	uint32_t cppcFailedCores {0};
 	uint8_t cppcHighest {0}, cppcNominal {0}, cppcLowestNonlinear {0}, cppcLowest {0}, cppcMaxPerf {0};
-	bool nvramLoaded {false};
+	bool bootArgsApplied {false};
 	uint8_t perfMode {Rog::PerfBalanced};
 	bool perfModeKnown {false};
 	int32_t perfRestore {-1};        // saved mode not yet accepted by the firmware
@@ -270,9 +269,7 @@ class EXPORT RogControl : public IOService {
 
 	void refreshSensors();
 	void applyFanControl(bool force);
-	void loadNvramSettings();
-	void storeNvramByte(const char *name, uint8_t value);
-	void storeNvramData(const char *name, const void *bytes, size_t len);
+	void applyBootArgs();
 	void publishStatus();
 	void note(const char *format, ...) __printflike(2, 3);
 	void cyclePerfMode();

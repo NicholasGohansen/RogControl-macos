@@ -86,8 +86,11 @@ func showStatus() {
 		print("Screen brightness: no control (the NVIDIA driver registered no backlight; needs boot-arg nvrmacpibl=1)")
 	}
 	if let touchpad = p["TouchpadEnabled"] as? Bool { print("Touchpad         : \(touchpad ? "on" : "off")") }
+	let found = p["KeyboardFound"] as? Bool == true ? "" : " (keyboard not found yet)"
 	if let level = num(p, "KeyboardBrightness") {
-		print("Keyboard light   : \(level)/3\(p["KeyboardFound"] as? Bool == true ? "" : " (keyboard not found yet)")")
+		print("Keyboard light   : \(level)/3\(found)")
+	} else if p["KeyboardFound"] != nil {
+		print("Keyboard light   : not set yet (firmware's)\(found)")
 	}
 	if let count = num(p, "HotkeyCount") {
 		let hook = p["KeyboardHotkeyHook"] as? Bool == true ? "keyboard hook on" : "keyboard hook OFF"

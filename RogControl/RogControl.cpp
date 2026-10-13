@@ -590,65 +590,22 @@ void RogControl::applyFanControl(bool force) {
 	customApplied = true;
 }
 
-void RogControl::loadNvramSettings() {
-	nvramLoaded = true;
-
-	int32_t mode = -1, charge = -1;
-	IORegistryEntry *options = IORegistryEntry::fromPath("/options", gIODTPlane);
-	if (options) {
-		auto m = OSDynamicCast(OSData, options->getProperty("rog-perf-mode"));
-		if (m && m->getLength() == 1)
-			mode = *static_cast<const uint8_t *>(m->getBytesNoCopy());
-		auto c = OSDynamicCast(OSData, options->getProperty("rog-charge-limit"));
-		if (c && c->getLength() == 1)
-			charge = *static_cast<const uint8_t *>(c->getBytesNoCopy());
-		options->release();
-	}
-
-	// Boot arguments take priority over the stored settings.
+// The kext imposes nothing at boot: the firmware's state stays until rogd applies the user's
+// settings (it keeps them on disk; NVRAM can't be used, OpenCore's DisableVariableWrite drops
+// what macOS writes). Only explicit boot-args are applied here, for use without rogd.
+void RogControl::applyBootArgs() {
+	bootArgsApplied = true;
 	int32_t arg = 0;
-	if (PE_parse_boot_argn("rogmode", &arg, sizeof(arg)))
-		mode = arg;
-	if (PE_parse_boot_argn("rogcharge", &arg, sizeof(arg)))
-		charge = arg;
-
-	// Like Linux asus-wmi, start from a known policy (Balanced unless one was saved).
-	if (mode < 0 || mode >= Rog::PerfModeCount)
-		mode = Rog::PerfBalanced;
-	if (writePerfMode(static_cast<uint8_t>(mode))) {
-		perfRestoredAt = pollCount;
-		note("mode %s restored", PerfModeNames[mode]);
-	} else {
-		perfRestore = mode;  // retried by the poller
-		note("mode %s not accepted yet, retrying", PerfModeNames[mode]);
-	}
-	if (charge >= 20 && charge <= 100)
-		writeChargeLimit(static_cast<uint8_t>(charge));
-
-	// Screen brightness: the firmware starts at its own level; put the last one back.
-	options = IORegistryEntry::fromPath("/options", gIODTPlane);
-	if (options) {
-		auto b = OSDynamicCast(OSData, options->getProperty("rog-screen-light"));
-		if (b && b->getLength() == 1 && *static_cast<const uint8_t *>(b->getBytesNoCopy()) <= screenMax)
-			setScreenLevel(*static_cast<const uint8_t *>(b->getBytesNoCopy()));
-		auto k = OSDynamicCast(OSData, options->getProperty("rog-bl-keys"));
-		if (k && k->getLength() == 1 && *static_cast<const uint8_t *>(k->getBytesNoCopy()) < Rog::BrightnessKeysCount)
-			brightnessKeys = *static_cast<const uint8_t *>(k->getBytesNoCopy());
-		options->release();
-	}
-
-	// Keyboard backlight level (Fn+F2/F3, rogctl kbd); written once the keyboard is up.
-	options = IORegistryEntry::fromPath("/options", gIODTPlane);
-	if (options) {
-		auto k = OSDynamicCast(OSData, options->getProperty("rog-kbd-light"));
-		if (k && k->getLength() == 1 && *static_cast<const uint8_t *>(k->getBytesNoCopy()) <= Rog::KbdMaxLevel) {
-			kbdLevel = *static_cast<const uint8_t *>(k->getBytesNoCopy());
-			kbdLevelKnown = true;
-			kbdPending = true;
-			note("keyboard light %u restored", kbdLevel);
+	if (PE_parse_boot_argn("rogmode", &arg, sizeof(arg)) && arg >= 0 && arg < Rog::PerfModeCount) {
+		if (writePerfMode(static_cast<uint8_t>(arg))) {
+			perfRestoredAt = pollCount;
+			note("rogmode=%d: mode %s", arg, PerfModeNames[arg]);
+		} else {
+			perfRestore = arg;  // retried by the poller
 		}
-		options->release();
 	}
+	if (PE_parse_boot_argn("rogcharge", &arg, sizeof(arg)) && arg >= 20 && arg <= 100)
+		writeChargeLimit(static_cast<uint8_t>(arg));
 
 	// The CPU stays stock (legacy P-states) until something asks for a cap or an energy
 	// preference: rogd from its config, or boot-args rogcpumax=MHz (0 = none) / rogepp=0..255.
@@ -663,23 +620,6 @@ void RogControl::loadNvramSettings() {
 	}
 	if (cpuConfigured)
 		applyCpuLimit();
-}
-
-void RogControl::storeNvramByte(const char *name, uint8_t value) {
-	storeNvramData(name, &value, sizeof(value));
-}
-
-void RogControl::storeNvramData(const char *name, const void *bytes, size_t len) {
-	auto options = IORegistryEntry::fromPath("/options", gIODTPlane);
-	if (!options)
-		return;
-	auto key = OSSymbol::withCString(name);
-	auto data = OSData::withBytes(bytes, static_cast<unsigned int>(len));
-	if (key && data && !options->setProperty(key, data))
-		SYSLOG("rog", "failed to store %s in NVRAM", name);
-	OSSafeReleaseNULL(key);
-	OSSafeReleaseNULL(data);
-	options->release();
 }
 
 // Keeps the last few events (boot restore, keyboard, backlight) readable with `rogctl events`:
@@ -712,7 +652,10 @@ void RogControl::publishStatus() {
 	else if (userCurveValid[0] || userCurveValid[1])
 		control = "curve";
 	setProperty("FanControl", control);
-	setProperty("KeyboardBrightness", kbdLevel, 32);
+	if (kbdLevelKnown)
+		setProperty("KeyboardBrightness", kbdLevel, 32);
+	else
+		removeProperty("KeyboardBrightness");
 	setProperty("KeyboardFound", kbd != nullptr && !kbd->isInactive());
 	setProperty("TouchpadEnabled", touchpadEnabled);
 	if (screenMax) {
@@ -784,7 +727,6 @@ void RogControl::cyclePerfMode() {
 	// Same order as Linux asus-wmi: balanced -> turbo -> silent -> balanced
 	uint8_t next = static_cast<uint8_t>((perfMode + 1) % Rog::PerfModeCount);
 	if (writePerfMode(next)) {
-		storeNvramByte("rog-perf-mode", next);
 		applyFanControl(true);
 		forceReapply = false;
 		publishStatus();
@@ -816,8 +758,7 @@ void RogControl::handleHotkey(uint32_t code, bool fromKeyboard) {
 			level++;
 		else if (code == Rog::EventKbdLightDown && level > 0)
 			level--;
-		if (writeKbdLevel(level))
-			storeNvramByte("rog-kbd-light", level);
+		writeKbdLevel(level);
 	} else if (code == Rog::EventTouchpadToggle) {
 		setTouchpad(!touchpadEnabled);
 	} else if ((code == Rog::EventScreenDown || code == Rog::EventScreenUp) && screenSource != Rog::BacklightSourceEc) {
@@ -834,8 +775,7 @@ void RogControl::handleHotkey(uint32_t code, bool fromKeyboard) {
 			level = level + step > screenMax ? screenMax : level + step;
 		else
 			level = level > step ? level - step : 0;
-		if (setScreenLevel(level))
-			screenSaveIn = 3;
+		setScreenLevel(level);
 	}
 	messageClients(Rog::MessageHotkey, reinterpret_cast<void *>(static_cast<uintptr_t>(code)));
 	publishStatus();
@@ -856,18 +796,14 @@ IOReturn RogControl::setPropertiesGated(OSDictionary *dict) {
 		}
 		if (mode < 0 || mode >= Rog::PerfModeCount || !writePerfMode(static_cast<uint8_t>(mode)))
 			ret = kIOReturnBadArgument;
-		else {
-			storeNvramByte("rog-perf-mode", static_cast<uint8_t>(mode));
+		else
 			controlChanged = true;
-		}
 	}
 
 	if (auto num = OSDynamicCast(OSNumber, dict->getObject("ChargeLimit"))) {
 		auto limit = num->unsigned32BitValue();
 		if (limit > 100 || !writeChargeLimit(static_cast<uint8_t>(limit)))
 			ret = kIOReturnBadArgument;
-		else
-			storeNvramByte("rog-charge-limit", static_cast<uint8_t>(limit));
 	}
 
 	static const char *const curveKeys[Rog::MaxFans] = {"FanCurveCPU", "FanCurveGPU"};
@@ -897,8 +833,6 @@ IOReturn RogControl::setPropertiesGated(OSDictionary *dict) {
 		auto level = num->unsigned32BitValue();
 		if (!setScreenLevel(level))
 			ret = kIOReturnBadArgument;
-		else
-			storeNvramByte("rog-screen-light", static_cast<uint8_t>(level));
 	}
 
 	if (auto str = OSDynamicCast(OSString, dict->getObject("BrightnessKeys"))) {
@@ -908,8 +842,6 @@ IOReturn RogControl::setPropertiesGated(OSDictionary *dict) {
 			brightnessKeys = Rog::BrightnessKeysConsumer;
 		else
 			ret = kIOReturnBadArgument;
-		if (ret != kIOReturnBadArgument)
-			storeNvramByte("rog-bl-keys", brightnessKeys);
 	}
 
 	if (auto flag = OSDynamicCast(OSBoolean, dict->getObject("TouchpadEnabled"))) {
@@ -919,10 +851,20 @@ IOReturn RogControl::setPropertiesGated(OSDictionary *dict) {
 
 	if (auto num = OSDynamicCast(OSNumber, dict->getObject("KeyboardBrightness"))) {
 		auto level = num->unsigned32BitValue();
-		if (level > Rog::KbdMaxLevel || !writeKbdLevel(static_cast<uint8_t>(level)))
+		if (level > Rog::KbdMaxLevel) {
 			ret = kIOReturnBadArgument;
-		else
-			storeNvramByte("rog-kbd-light", static_cast<uint8_t>(level));
+		} else if (!writeKbdLevel(static_cast<uint8_t>(level))) {
+			if (kbd && !kbd->isInactive()) {
+				ret = kIOReturnNotResponding;
+			} else {
+				// rogd sets it at boot, before the keyboard's driver is up: written once it is.
+				kbdLevel = static_cast<uint8_t>(level);
+				kbdLevelKnown = true;
+				kbdPending = true;
+				kbdWaited = 0;
+				note("keyboard light %u queued", kbdLevel);
+			}
+		}
 	}
 
 	if (auto num = OSDynamicCast(OSNumber, dict->getObject("CPUMaxFrequencyMHz"))) {
@@ -1121,8 +1063,8 @@ bool RogControl::start(IOService *provider) {
 		auto self = OSDynamicCast(RogControl, owner);
 		if (!self)
 			return;
-		if (!self->nvramLoaded && self->pollCount >= 2)
-			self->loadNvramSettings();
+		if (!self->bootArgsApplied && self->pollCount >= 2)
+			self->applyBootArgs();
 		self->refreshSensors();
 		bool dirty = atomic_exchange_explicit(&self->shared.controlDirty, false, memory_order_acquire);
 		if (dirty || self->forceReapply) {
@@ -1163,8 +1105,6 @@ bool RogControl::start(IOService *provider) {
 				}
 			}
 		}
-		if (self->screenSaveIn && --self->screenSaveIn == 0)
-			self->storeNvramByte("rog-screen-light", static_cast<uint8_t>(self->screenLevel));
 		if (self->kbdPending && self->kbdLevelKnown) {
 			if (self->writeKbdLevel(self->kbdLevel)) {
 				self->note("keyboard light %u written", self->kbdLevel);
