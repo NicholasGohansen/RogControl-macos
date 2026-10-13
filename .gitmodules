@@ -1,0 +1,9 @@
+[submodule "deps/Lilu"]
+	path = deps/Lilu
+	url = https://github.com/acidanthera/Lilu.git
+[submodule "deps/VirtualSMC"]
+	path = deps/VirtualSMC
+	url = https://github.com/acidanthera/VirtualSMC.git
+[submodule "deps/MacKernelSDK"]
+	path = deps/MacKernelSDK
+	url = https://github.com/acidanthera/MacKernelSDK.git
