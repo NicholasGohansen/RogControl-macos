@@ -11,9 +11,13 @@ same ASUS WMI calls Linux `asus-wmi` makes (`\_SB.ATKD.WMNB`):
 - performance modes Silent / Balanced / Turbo, also on Fn+F5
 - custom fan curves (8 points per fan) and fixed fan speeds
 - battery charge limit
+- CPU frequency cap through AMD CPPC, like Linux `amd-pstate` /
+  `cpupower frequency-set -u` (default 4200 MHz), with an energy preference (EPP)
+- package power limits PL1/PL2/FPPT and NVIDIA dynamic boost / temperature target
+  (the asusd "tunings")
 
-Planned: CPU frequency cap and power limits, saved profiles, Fn keys, keyboard
-backlight and Aura lighting (background service + `rogctl`), menu-bar app.
+Planned: saved profiles, Fn keys, keyboard backlight and Aura lighting
+(background service + `rogctl`), menu-bar app.
 
 ## Requirements
 
@@ -41,9 +45,16 @@ sudo rogctl charge 80
 sudo rogctl fan 60 | auto
 sudo rogctl curve cpu 40:10,50:20,60:30,70:45,75:55,80:70,90:90,100:100
 sudo rogctl curve reset
+sudo rogctl cpu max 4200 | off
+sudo rogctl cpu epp performance|balance_performance|balance_power|power
+sudo rogctl power pl1 70 pl2 95 fppt 100   # watts; 'default' resets one
+sudo rogctl gpu boost 5 temp 75
 ```
 
-Mode and charge limit persist in NVRAM; boot-args `rogmode=0|1|2` (balanced,
-turbo, silent) and `rogcharge=N` override them. Custom curves never drop below
+Mode, charge limit and CPU cap persist in NVRAM; boot-args `rogmode=0|1|2`
+(balanced, turbo, silent), `rogcharge=N`, `rogcpumax=MHz` (0 = no cap) and
+`rogepp=0..255` override them. `-rogcontrolnocppc` leaves the CPU alone. Power
+limits and GPU settings are not stored yet (the firmware resets them on mode
+changes; RogControl writes them again until reboot). Custom curves never drop below
 80% at 90 °C (`-rogcontrolnosafety` disables that). `-rogcontroloff` disables
 the kext, `-rogcontroldbg` enables debug logging.
