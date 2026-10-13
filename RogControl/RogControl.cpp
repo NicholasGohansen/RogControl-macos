@@ -7,6 +7,7 @@
 #include "KeyImplementations.hpp"
 
 #include <IOKit/IOUserClient.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/acpi/IOACPITypes.h>
 #include <kern/task.h>
@@ -243,6 +244,83 @@ bool RogControl::writeChargeLimit(uint8_t limit) {
 	return true;
 }
 
+IOHIDDevice *RogControl::findKeyboard() {
+	if (kbd && !kbd->isInactive())
+		return kbd;
+	OSSafeReleaseNULL(kbd);
+	kbdReady = false;
+
+	// The N-KEY keyboard is served by a DriverKit HID driver that starts after launchd,
+	// so it shows up some seconds after this kext.
+	auto match = IOService::serviceMatching("IOHIDDevice");
+	auto props = OSDictionary::withCapacity(1);
+	auto vendor = OSNumber::withNumber(Rog::AsusVendorID, 32);
+	if (match && props && vendor) {
+		props->setObject("VendorID", vendor);
+		match->setObject(gIOPropertyMatchKey, props);
+		if (auto it = IOService::getMatchingServices(match)) {
+			while (auto obj = it->getNextObject()) {
+				auto dev = OSDynamicCast(IOHIDDevice, obj);
+				auto product = dev ? OSDynamicCast(OSString, dev->getProperty("Product")) : nullptr;
+				auto feature = dev ? OSDynamicCast(OSNumber, dev->getProperty("MaxFeatureReportSize")) : nullptr;
+				if (product && product->isEqualTo("N-KEY Device") && feature && feature->unsigned32BitValue() >= 16) {
+					dev->retain();
+					kbd = dev;
+					break;
+				}
+			}
+			it->release();
+		}
+	}
+	OSSafeReleaseNULL(vendor);
+	OSSafeReleaseNULL(props);
+	OSSafeReleaseNULL(match);
+	if (kbd)
+		DBGLOG("rog", "N-KEY keyboard found");
+	return kbd;
+}
+
+bool RogControl::sendKbdReport(const uint8_t *bytes, size_t len) {
+	auto dev = findKeyboard();
+	if (!dev)
+		return false;
+	auto feature = OSDynamicCast(OSNumber, dev->getProperty("MaxFeatureReportSize"));
+	size_t size = feature ? feature->unsigned32BitValue() : 64;
+	if (len > size)
+		return false;
+	// The buffer starts with the report ID, like Linux hid_hw_raw_request().
+	auto md = IOBufferMemoryDescriptor::withCapacity(size, kIODirectionOut);
+	if (!md)
+		return false;
+	memset(md->getBytesNoCopy(), 0, size);
+	lilu_os_memcpy(md->getBytesNoCopy(), bytes, len);
+	md->setLength(size);
+	IOReturn ret = dev->setReport(md, kIOHIDReportTypeFeature, bytes[0]);
+	md->release();
+	if (ret != kIOReturnSuccess)
+		SYSLOG("rog", "keyboard report %02X %02X failed %08X", bytes[0], len > 1 ? bytes[1] : 0, ret);
+	return ret == kIOReturnSuccess;
+}
+
+bool RogControl::writeKbdLevel(uint8_t level) {
+	if (level > Rog::KbdMaxLevel)
+		return false;
+	if (!kbdReady) {
+		// hid-asus asus_kbd_init(): the keyboard wants this before taking commands.
+		static const uint8_t init[] = {Rog::KbdReportID, 'A', 'S', 'U', 'S', ' ', 'T', 'e', 'c', 'h', '.', 'I', 'n', 'c', '.', 0};
+		if (!sendKbdReport(init, sizeof(init)))
+			return false;
+		kbdReady = true;
+	}
+	// hid-asus asus_kbd_backlight_work()
+	const uint8_t cmd[] = {Rog::KbdReportID, 0xBA, 0xC5, 0xC4, level};
+	if (!sendKbdReport(cmd, sizeof(cmd)))
+		return false;
+	kbdLevel = level;
+	kbdPending = false;
+	return true;
+}
+
 void RogControl::writeTunables() {
 	for (size_t i = 0; i < Rog::TunableCount; i++) {
 		if (!haveTunable[i] || !tunable[i])
@@ -402,6 +480,17 @@ void RogControl::loadNvramSettings() {
 	if (charge >= 20 && charge <= 100)
 		writeChargeLimit(static_cast<uint8_t>(charge));
 
+	// Keyboard backlight level (Fn+F2/F3, rogctl kbd); written once the keyboard is up.
+	options = IORegistryEntry::fromPath("/options", gIODTPlane);
+	if (options) {
+		auto k = OSDynamicCast(OSData, options->getProperty("rog-kbd-light"));
+		if (k && k->getLength() == 1 && *static_cast<const uint8_t *>(k->getBytesNoCopy()) <= Rog::KbdMaxLevel) {
+			kbdLevel = *static_cast<const uint8_t *>(k->getBytesNoCopy());
+			kbdPending = true;
+		}
+		options->release();
+	}
+
 	// The CPU stays stock (legacy P-states) until something asks for a cap or an energy
 	// preference: rogd from its config, or boot-args rogcpumax=MHz (0 = none) / rogepp=0..255.
 	bool cpuConfigured = false;
@@ -450,6 +539,10 @@ void RogControl::publishStatus() {
 	else if (userCurveValid[0] || userCurveValid[1])
 		control = "curve";
 	setProperty("FanControl", control);
+	setProperty("KeyboardBrightness", kbdLevel, 32);
+	setProperty("KeyboardFound", kbd != nullptr && !kbd->isInactive());
+	setProperty("LastHotkey", lastHotkey, 32);
+	setProperty("HotkeyCount", hotkeyCount, 32);
 	setProperty("CPUMaxFrequencyMHz", cpuMaxMHz, 32);
 	setProperty("CPUEnergyPreference", cpuEpp, 32);
 	setProperty("CPUFrequencyLimitActive", cppcActive);
@@ -507,8 +600,21 @@ void RogControl::cyclePerfMode() {
 
 void RogControl::handleAtkEvent(uint32_t code) {
 	DBGLOG("rog", "ATK event %02X", code);
-	if (code == Rog::EventThermalPolicy || code == Rog::EventFanBoost)
+	lastHotkey = code;
+	hotkeyCount++;
+	if (code == Rog::EventThermalPolicy || code == Rog::EventFanBoost) {
 		cyclePerfMode();
+	} else if (code == Rog::EventKbdLightUp || code == Rog::EventKbdLightDown) {
+		uint8_t level = kbdLevel;
+		if (code == Rog::EventKbdLightUp && level < Rog::KbdMaxLevel)
+			level++;
+		else if (code == Rog::EventKbdLightDown && level > 0)
+			level--;
+		if (writeKbdLevel(level))
+			storeNvramByte("rog-kbd-light", level);
+	}
+	messageClients(Rog::MessageHotkey, reinterpret_cast<void *>(static_cast<uintptr_t>(code)));
+	publishStatus();
 }
 
 IOReturn RogControl::setPropertiesGated(OSDictionary *dict) {
@@ -561,6 +667,14 @@ IOReturn RogControl::setPropertiesGated(OSDictionary *dict) {
 			userCurveValid[i] = false;
 			controlChanged = true;
 		}
+	}
+
+	if (auto num = OSDynamicCast(OSNumber, dict->getObject("KeyboardBrightness"))) {
+		auto level = num->unsigned32BitValue();
+		if (level > Rog::KbdMaxLevel || !writeKbdLevel(static_cast<uint8_t>(level)))
+			ret = kIOReturnBadArgument;
+		else
+			storeNvramByte("rog-kbd-light", static_cast<uint8_t>(level));
 	}
 
 	if (auto num = OSDynamicCast(OSNumber, dict->getObject("CPUMaxFrequencyMHz"))) {
@@ -774,6 +888,10 @@ bool RogControl::start(IOService *provider) {
 			self->cpuDirty = false;
 			self->applyCpuLimit();
 		}
+		if (self->kbdPending) {
+			if (self->writeKbdLevel(self->kbdLevel) || ++self->kbdWaited > Rog::KbdRetrySeconds)
+				self->kbdPending = false;
+		}
 		if ((self->pollCount++ % 2) == 0)
 			self->publishStatus();
 		sender->setTimeoutMS(Rog::PollIntervalMS);
@@ -830,6 +948,9 @@ IOReturn RogControl::sleepHandler(void *target, void *refCon, UInt32 messageType
 			s->forceReapply = true;
 			s->tunablesDirty = true;
 			s->cpuDirty = s->cppcActive;
+			s->kbdReady = false;
+			s->kbdPending = true;
+			s->kbdWaited = 0;
 			return kIOReturnSuccess;
 		});
 	}

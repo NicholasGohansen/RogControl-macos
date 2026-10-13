@@ -16,6 +16,7 @@ usage: rogctl [status]                       fans, temperatures, profile, CPU/po
        rogctl curve cpu|gpu T:P,T:P,... (8 points) [-p P]
        rogctl curve reset [-p P]             firmware fan curves for that profile
        rogctl charge <20-100>                battery charge limit
+       rogctl kbd <0-3>                      keyboard backlight (also Fn+F2 / Fn+F3)
        rogctl fan <0-100>|auto               force both fans now (not saved)
        rogctl config                         show the config file
 
@@ -73,6 +74,9 @@ func showStatus() {
 	print("Power limits     : \(power.isEmpty ? "not supported" : power.joined(separator: ", "))")
 	print("GPU (NVIDIA)     : \(gpu.isEmpty ? "not supported" : gpu.joined(separator: ", "))")
 	if let charge = num(p, "ChargeLimit"), charge > 0 { print("Charge limit     : \(charge)%") }
+	if let level = num(p, "KeyboardBrightness") {
+		print("Keyboard light   : \(level)/3\(p["KeyboardFound"] as? Bool == true ? "" : " (keyboard not found yet)")")
+	}
 	if let c = curveString(p["AppliedCurveCPU"] as? Data) { print("  CPU curve: \(c)") }
 	if let c = curveString(p["AppliedCurveGPU"] as? Data) { print("  GPU curve: \(c)") }
 }
@@ -233,6 +237,12 @@ case "charge":
 	var config = (try? Config.load()) ?? Config()
 	config.chargeLimit = v
 	commit(config)
+case "kbd":
+	guard args.count == 1, let level = Int(args[0]), (0...3).contains(level) else { fail("kbd needs a level 0-3") }
+	let ret = kext.set(["KeyboardBrightness": level])
+	if ret == kIOReturnNotPrivileged { fail("permission denied, run with sudo") }
+	if ret != KERN_SUCCESS { fail(String(format: "the keyboard did not take it (0x%x)", ret)) }
+	showStatus()
 case "fan":
 	guard args.count == 1 else { fail(usage, code: 2) }
 	let pct = args[0] == "auto" ? -1 : (Int(args[0]) ?? -2)

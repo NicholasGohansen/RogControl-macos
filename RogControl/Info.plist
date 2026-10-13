@@ -56,6 +56,8 @@
 		<string>1.2.0</string>
 		<key>as.vit9696.VirtualSMC</key>
 		<string>1.0.0</string>
+		<key>com.apple.iokit.IOHIDFamily</key>
+		<string>2.0.0</string>
 		<key>com.apple.iokit.IOACPIFamily</key>
 		<string>1.0.0d1</string>
 		<key>com.apple.kpi.bsd</key>

@@ -18,6 +18,7 @@
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/acpi/IOACPIPlatformDevice.h>
 #include <IOKit/pwr_mgt/RootDomain.h>
+#include <IOKit/hid/IOHIDDevice.h>
 #include <stdatomic.h>
 
 #include <VirtualSMCSDK/kern_vsmcapi.hpp>
@@ -76,6 +77,18 @@ namespace Rog {
 	// ATKD notify codes for the Fn+F5 "fan" key
 	constexpr uint32_t EventFanBoost = 0x99;
 	constexpr uint32_t EventThermalPolicy = 0xAE;
+	// Fn+F3 / Fn+F2 keyboard backlight (EC queries 0x17 / 0x16)
+	constexpr uint32_t EventKbdLightUp = 0xC4;
+	constexpr uint32_t EventKbdLightDown = 0xC5;
+
+	// N-KEY USB keyboard (Linux hid-asus): feature report 0x5A
+	constexpr uint32_t AsusVendorID = 0x0B05;
+	constexpr uint8_t KbdReportID = 0x5A;
+	constexpr uint8_t KbdMaxLevel = 3;
+	constexpr uint32_t KbdRetrySeconds = 180;
+
+	// Every ATK hotkey is also sent to user-space clients (rogd) with this message, code in the argument.
+	constexpr uint32_t MessageHotkey = iokit_vendor_specific_msg(0x52);
 
 	// Thermal policy values accepted by DEVS 0x00120075
 	enum PerfMode : uint8_t {
@@ -149,6 +162,15 @@ class EXPORT RogControl : public IOService {
 	bool haveFanCurves {false};
 	bool havePolicy {false};
 	bool haveChargeLimit {false};
+	// Keyboard backlight through the N-KEY keyboard's HID feature report
+	IOHIDDevice *kbd {nullptr};
+	bool kbdReady {false};          // handshake sent to this keyboard instance
+	bool kbdPending {false};        // level still to be written (keyboard not up yet)
+	uint32_t kbdWaited {0};
+	uint8_t kbdLevel {Rog::KbdMaxLevel};
+	uint32_t lastHotkey {0};
+	uint32_t hotkeyCount {0};
+
 	bool haveTunable[Rog::TunableCount] {};
 	uint8_t tunable[Rog::TunableCount] {};  // 0 = firmware default
 	bool tunablesDirty {false};
@@ -184,6 +206,9 @@ class EXPORT RogControl : public IOService {
 	bool writePerfMode(uint8_t mode);
 	bool writeChargeLimit(uint8_t limit);
 	void writeTunables();
+	IOHIDDevice *findKeyboard();
+	bool sendKbdReport(const uint8_t *bytes, size_t len);
+	bool writeKbdLevel(uint8_t level);
 	void applyCpuLimit();
 
 	void refreshSensors();
