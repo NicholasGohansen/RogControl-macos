@@ -26,6 +26,10 @@
 		<dict>
 			<key>CFBundleIdentifier</key>
 			<string>com.pengubow.RogControl</string>
+			<key>DefaultCPUEnergyPreference</key>
+			<integer>128</integer>
+			<key>DefaultCPUMaxFrequencyMHz</key>
+			<integer>4200</integer>
 			<key>DefaultFanCurveCPU</key>
 			<data>
 			HCYxOkJLVGMbJjNDTVpjYw==

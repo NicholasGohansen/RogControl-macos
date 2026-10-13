@@ -25,6 +25,74 @@ static bool safetyFloor = true;
 
 static const char *const PerfModeNames[Rog::PerfModeCount] = {"balanced", "turbo", "silent"};
 
+// Kernel functions from com.apple.kpi.unsupported (AMDRyzenCPUPowerManagement uses the same ones).
+extern "C" {
+	int cpu_number(void);
+	void mp_rendezvous_no_intrs(void (*action_func)(void *), void *arg);
+	int rdmsr_carefully(uint32_t msr, uint32_t *lo, uint32_t *hi);
+}
+
+static inline void rogWrmsr(uint32_t msr, uint64_t value) {
+	asm volatile("wrmsr" :: "c"(msr), "a"(static_cast<uint32_t>(value)), "d"(static_cast<uint32_t>(value >> 32)));
+}
+
+static bool rogRdmsr(uint32_t msr, uint64_t &value) {
+	uint32_t lo = 0, hi = 0;
+	if (rdmsr_carefully(msr, &lo, &hi) != 0)
+		return false;
+	value = (static_cast<uint64_t>(hi) << 32) | lo;
+	return true;
+}
+
+namespace {
+// One request for every core: Linux amd-pstate (active mode) does the same per CPU,
+// enable CPPC, then MSR_AMD_CPPC_REQ = max_perf | min_perf << 8 | desired 0 (autonomous) | EPP << 24.
+struct CppcJob {
+	uint32_t maxMHz;
+	uint32_t nominalMHz;
+	uint8_t epp;
+	_Atomic(uint32_t) ok;
+	_Atomic(uint32_t) failed;
+	_Atomic(bool) recorded;
+	uint8_t highest, nominal, lowestNonlinear, lowest, maxPerf;
+};
+}
+
+static void cppcApplyOnCpu(void *arg) {
+	auto job = static_cast<CppcJob *>(arg);
+	uint64_t cap = 0;
+	if (!rogRdmsr(Rog::MsrCppcCap1, cap) || (cap & 0xFFFFFFFF) == 0) {
+		atomic_fetch_add_explicit(&job->failed, 1, memory_order_relaxed);
+		return;
+	}
+	uint8_t lowest = cap & 0xFF, lowestNonlinear = (cap >> 8) & 0xFF;
+	uint8_t nominal = (cap >> 16) & 0xFF, highest = (cap >> 24) & 0xFF;
+	uint32_t maxPerf = highest;
+	if (job->maxMHz && job->nominalMHz && nominal) {
+		maxPerf = job->maxMHz * nominal / job->nominalMHz;
+		if (maxPerf > highest)
+			maxPerf = highest;
+		if (maxPerf < lowest)
+			maxPerf = lowest;
+	}
+	rogWrmsr(Rog::MsrCppcEnable, 1);
+	rogWrmsr(Rog::MsrCppcReq, maxPerf | (static_cast<uint64_t>(lowest) << 8) |
+		(static_cast<uint64_t>(job->epp) << 24));
+	// Frequencies above nominal need Core Performance Boost; the cap is CPPC's job now.
+	uint64_t hwcr = 0;
+	if (rogRdmsr(Rog::MsrHwcr, hwcr) && (hwcr & Rog::HwcrCpbDis))
+		rogWrmsr(Rog::MsrHwcr, hwcr & ~Rog::HwcrCpbDis);
+	bool expected = false;
+	if (atomic_compare_exchange_strong(&job->recorded, &expected, true)) {
+		job->highest = highest;
+		job->nominal = nominal;
+		job->lowestNonlinear = lowestNonlinear;
+		job->lowest = lowest;
+		job->maxPerf = static_cast<uint8_t>(maxPerf);
+	}
+	atomic_fetch_add_explicit(&job->ok, 1, memory_order_relaxed);
+}
+
 static inline uint32_t pack4(const uint8_t *v) {
 	return v[0] | (v[1] << 8) | (v[2] << 16) | (static_cast<uint32_t>(v[3]) << 24);
 }
@@ -52,6 +120,27 @@ void RogControl::flatCurve(RogFanCurve &curve, uint8_t percent) {
 		curve.temp[i] = temps[i];
 		curve.percent[i] = percent;
 	}
+}
+
+bool RogControl::eppFromObject(OSObject *obj, uint8_t &epp) {
+	if (auto num = OSDynamicCast(OSNumber, obj)) {
+		auto v = num->unsigned32BitValue();
+		if (v > 255)
+			return false;
+		epp = static_cast<uint8_t>(v);
+		return true;
+	}
+	static const struct { const char *name; uint8_t value; } names[] = {
+		{"performance", Rog::EppPerformance}, {"balance_performance", Rog::EppBalancePerformance},
+		{"balance_power", Rog::EppBalancePower}, {"power", Rog::EppPower},
+	};
+	if (auto str = OSDynamicCast(OSString, obj))
+		for (auto &n : names)
+			if (str->isEqualTo(n.name)) {
+				epp = n.value;
+				return true;
+			}
+	return false;
 }
 
 bool RogControl::wmnb(uint32_t method, uint32_t device, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4, OSObject **result) {
@@ -137,8 +226,9 @@ bool RogControl::writePerfMode(uint8_t mode) {
 	SYSLOG("rog", "performance mode -> %s", PerfModeNames[mode]);
 	perfMode = mode;
 	perfModeKnown = true;
-	// The firmware drops custom curves on a policy change; put ours back if any are wanted.
+	// The firmware drops custom curves and power limits on a policy change; put ours back.
 	forceReapply = true;
+	tunablesDirty = true;
 	return true;
 }
 
@@ -151,6 +241,42 @@ bool RogControl::writeChargeLimit(uint8_t limit) {
 	SYSLOG("rog", "battery charge limit -> %u%%", limit);
 	chargeLimit = limit;
 	return true;
+}
+
+void RogControl::writeTunables() {
+	for (size_t i = 0; i < Rog::TunableCount; i++) {
+		if (!haveTunable[i] || !tunable[i])
+			continue;
+		uint32_t value = 0;
+		bool ok = wmnbInt(Rog::MethodDevs, Rog::Tunables[i].device, tunable[i], value);
+		DBGLOG("rog", "%s -> %u: %d (%08X)", Rog::Tunables[i].name, tunable[i], ok, value);
+		(void)ok;
+	}
+}
+
+void RogControl::applyCpuLimit() {
+	if (!cppcAllowed || !cppcSupported)
+		return;
+	CppcJob job {};
+	job.maxMHz = cpuMaxMHz;
+	job.nominalMHz = nominalMHz;
+	job.epp = cpuEpp;
+	atomic_init(&job.ok, 0);
+	atomic_init(&job.failed, 0);
+	atomic_init(&job.recorded, false);
+	mp_rendezvous_no_intrs(cppcApplyOnCpu, &job);
+	cppcCores = atomic_load(&job.ok);
+	cppcFailedCores = atomic_load(&job.failed);
+	cppcActive = cppcCores > 0;
+	if (cppcActive) {
+		cppcHighest = job.highest;
+		cppcNominal = job.nominal;
+		cppcLowestNonlinear = job.lowestNonlinear;
+		cppcLowest = job.lowest;
+		cppcMaxPerf = job.maxPerf;
+	}
+	SYSLOG("rog", "CPU cap %u MHz (nominal %u MHz) EPP %u: max_perf %u (highest %u nominal %u lowest %u) on %u cores, %u failed",
+		cpuMaxMHz, nominalMHz, cpuEpp, cppcMaxPerf, cppcHighest, cppcNominal, cppcLowest, cppcCores, cppcFailedCores);
 }
 
 void RogControl::refreshSensors() {
@@ -251,7 +377,7 @@ void RogControl::loadNvramSettings() {
 	nvramLoaded = true;
 
 	int32_t mode = -1, charge = -1;
-	auto options = IORegistryEntry::fromPath("/options", gIODTPlane);
+	IORegistryEntry *options = IORegistryEntry::fromPath("/options", gIODTPlane);
 	if (options) {
 		auto m = OSDynamicCast(OSData, options->getProperty("rog-perf-mode"));
 		if (m && m->getLength() == 1)
@@ -275,14 +401,41 @@ void RogControl::loadNvramSettings() {
 	writePerfMode(static_cast<uint8_t>(mode));
 	if (charge >= 20 && charge <= 100)
 		writeChargeLimit(static_cast<uint8_t>(charge));
+
+	// CPU cap: Info.plist default < NVRAM < boot-args (rogcpumax=MHz, 0 = none; rogepp=0..255).
+	if (auto n = OSDynamicCast(OSNumber, getProperty("DefaultCPUMaxFrequencyMHz")))
+		cpuMaxMHz = n->unsigned32BitValue();
+	if (auto n = OSDynamicCast(OSNumber, getProperty("DefaultCPUEnergyPreference")))
+		cpuEpp = static_cast<uint8_t>(n->unsigned32BitValue());
+	options = IORegistryEntry::fromPath("/options", gIODTPlane);
+	if (options) {
+		auto m = OSDynamicCast(OSData, options->getProperty("rog-cpu-max"));
+		if (m && m->getLength() == 2) {
+			auto b = static_cast<const uint8_t *>(m->getBytesNoCopy());
+			cpuMaxMHz = b[0] | (b[1] << 8);
+		}
+		auto e = OSDynamicCast(OSData, options->getProperty("rog-cpu-epp"));
+		if (e && e->getLength() == 1)
+			cpuEpp = *static_cast<const uint8_t *>(e->getBytesNoCopy());
+		options->release();
+	}
+	if (PE_parse_boot_argn("rogcpumax", &arg, sizeof(arg)) && arg >= 0)
+		cpuMaxMHz = static_cast<uint32_t>(arg);
+	if (PE_parse_boot_argn("rogepp", &arg, sizeof(arg)) && arg >= 0 && arg <= 255)
+		cpuEpp = static_cast<uint8_t>(arg);
+	applyCpuLimit();
 }
 
 void RogControl::storeNvramByte(const char *name, uint8_t value) {
+	storeNvramData(name, &value, sizeof(value));
+}
+
+void RogControl::storeNvramData(const char *name, const void *bytes, size_t len) {
 	auto options = IORegistryEntry::fromPath("/options", gIODTPlane);
 	if (!options)
 		return;
 	auto key = OSSymbol::withCString(name);
-	auto data = OSData::withBytes(&value, sizeof(value));
+	auto data = OSData::withBytes(bytes, static_cast<unsigned int>(len));
 	if (key && data && !options->setProperty(key, data))
 		SYSLOG("rog", "failed to store %s in NVRAM", name);
 	OSSafeReleaseNULL(key);
@@ -306,6 +459,41 @@ void RogControl::publishStatus() {
 	else if (userCurveValid[0] || userCurveValid[1])
 		control = "curve";
 	setProperty("FanControl", control);
+	setProperty("CPUMaxFrequencyMHz", cpuMaxMHz, 32);
+	setProperty("CPUEnergyPreference", cpuEpp, 32);
+	setProperty("CPUFrequencyLimitActive", cppcActive);
+	if (auto cppc = OSDictionary::withCapacity(8)) {
+		auto put = [cppc](const char *key, uint32_t value) {
+			if (auto n = OSNumber::withNumber(value, 32)) {
+				cppc->setObject(key, n);
+				n->release();
+			}
+		};
+		cppc->setObject("Supported", cppcSupported ? kOSBooleanTrue : kOSBooleanFalse);
+		put("NominalMHz", nominalMHz);
+		put("Cores", cppcCores);
+		put("FailedCores", cppcFailedCores);
+		put("HighestPerf", cppcHighest);
+		put("NominalPerf", cppcNominal);
+		put("LowestNonlinearPerf", cppcLowestNonlinear);
+		put("LowestPerf", cppcLowest);
+		put("MaxPerf", cppcMaxPerf);
+		setProperty("CPPC", cppc);
+		cppc->release();
+	}
+	if (auto tun = OSDictionary::withCapacity(Rog::TunableCount)) {
+		for (size_t i = 0; i < Rog::TunableCount; i++) {
+			if (!haveTunable[i])
+				continue;
+			if (auto n = OSNumber::withNumber(tunable[i], 32)) {
+				tun->setObject(Rog::Tunables[i].name, n);
+				n->release();
+			}
+		}
+		setProperty("Tunables", tun);
+		tun->release();
+	}
+
 	if (customApplied) {
 		setProperty("AppliedCurveCPU", &appliedCurve[0], sizeof(RogFanCurve));
 		setProperty("AppliedCurveGPU", &appliedCurve[1], sizeof(RogFanCurve));
@@ -384,6 +572,51 @@ IOReturn RogControl::setPropertiesGated(OSDictionary *dict) {
 		}
 	}
 
+	if (auto num = OSDynamicCast(OSNumber, dict->getObject("CPUMaxFrequencyMHz"))) {
+		auto mhz = num->unsigned32BitValue();
+		if (!cppcSupported || !cppcAllowed || (mhz != 0 && (mhz < 400 || mhz > 6500))) {
+			ret = kIOReturnBadArgument;
+		} else {
+			cpuMaxMHz = mhz;
+			uint8_t bytes[2] = {static_cast<uint8_t>(mhz), static_cast<uint8_t>(mhz >> 8)};
+			storeNvramData("rog-cpu-max", bytes, sizeof(bytes));
+			applyCpuLimit();
+		}
+	}
+
+	if (auto obj = dict->getObject("CPUEnergyPreference")) {
+		uint8_t epp = 0;
+		if (!cppcSupported || !cppcAllowed || !eppFromObject(obj, epp)) {
+			ret = kIOReturnBadArgument;
+		} else {
+			cpuEpp = epp;
+			storeNvramByte("rog-cpu-epp", epp);
+			applyCpuLimit();
+		}
+	}
+
+	// Power limits and NVIDIA settings: watts / degrees; 0 restores the firmware value
+	// (re-selecting the performance mode resets them, then the others are written again).
+	bool resetTunables = false, tunablesChanged = false;
+	for (size_t i = 0; i < Rog::TunableCount; i++) {
+		auto num = OSDynamicCast(OSNumber, dict->getObject(Rog::Tunables[i].name));
+		if (!num)
+			continue;
+		tunablesChanged = true;
+		auto v = num->unsigned32BitValue();
+		if (!haveTunable[i] || (v != 0 && (v < Rog::Tunables[i].min || v > Rog::Tunables[i].max))) {
+			ret = kIOReturnBadArgument;
+			continue;
+		}
+		if (v == 0 && tunable[i])
+			resetTunables = true;
+		tunable[i] = static_cast<uint8_t>(v);
+	}
+	if (resetTunables && perfModeKnown)
+		writePerfMode(perfMode);
+	if (tunablesChanged)
+		writeTunables();
+
 	if (dict->getObject("FanCurvesReset")) {
 		userCurveValid[0] = userCurveValid[1] = false;
 		controlChanged = true;
@@ -440,11 +673,30 @@ IOService *RogControl::probe(IOService *provider, SInt32 *score) {
 	uint32_t v = 0;
 	havePolicy = wmnbInt(Rog::MethodDsts, Rog::DevThermalPolicy, 0, v) && v != Rog::DstsUnsupported && (v & Rog::DstsPresent);
 	haveChargeLimit = wmnbInt(Rog::MethodDsts, Rog::DevChargeLimit, 0, v) && v != Rog::DstsUnsupported && (v & Rog::DstsPresent);
+	for (size_t i = 0; i < Rog::TunableCount; i++)
+		haveTunable[i] = wmnbInt(Rog::MethodDsts, Rog::Tunables[i].device, 0, v) && v != Rog::DstsUnsupported && (v & Rog::DstsPresent);
+
+	// CPPC: CPUID 0x80000008 EBX bit 27. Nominal clock from P-state 0 (CpuFid / CpuDfsId * 200 MHz).
+	cppcAllowed = !checkKernelArgument("-rogcontrolnocppc");
+	uint32_t eax = 0x80000008, ebx = 0, ecx = 0, edx = 0;
+	asm volatile("cpuid" : "+a"(eax), "=b"(ebx), "+c"(ecx), "=d"(edx));
+	cppcSupported = (ebx >> 27) & 1;
+	uint64_t p0 = 0;
+	if (rogRdmsr(Rog::MsrPState0, p0) && (p0 >> 63)) {
+		uint32_t fid = p0 & 0xFF, dfs = (p0 >> 8) & 0x3F;
+		if (dfs)
+			nominalMHz = fid * 200 / dfs;
+	}
+	if (!nominalMHz)
+		cppcSupported = false;
 	for (uint8_t mode = 0; mode < Rog::PerfModeCount; mode++)
 		for (size_t fan = 0; fan < Rog::MaxFans; fan++)
 			factoryCurveValid[mode][fan] = readFactoryCurve(mode, fan, factoryCurve[mode][fan]);
 	haveFanCurves = factoryCurveValid[0][0] && factoryCurveValid[0][1];
 
+	SYSLOG("rog", "tunables PL1 %d PL2 %d FPPT %d NV boost %d NV temp %d, CPPC %d (nominal %u MHz)",
+		haveTunable[Rog::TunePl1], haveTunable[Rog::TunePl2], haveTunable[Rog::TuneFppt],
+		haveTunable[Rog::TuneNvBoost], haveTunable[Rog::TuneNvTemp], cppcSupported, nominalMHz);
 	SYSLOG("rog", "ATKD found: sensors %s, policy %d, fan curves %d, charge limit %d",
 		haveSensorMethod ? "RGSN" : "WMI", havePolicy, haveFanCurves, haveChargeLimit);
 
@@ -540,6 +792,14 @@ bool RogControl::start(IOService *provider) {
 			self->forceReapply = false;
 			self->applyFanControl(force);
 		}
+		if (self->tunablesDirty) {
+			self->tunablesDirty = false;
+			self->writeTunables();
+		}
+		if (self->cpuDirty) {
+			self->cpuDirty = false;
+			self->applyCpuLimit();
+		}
 		if ((self->pollCount++ % 2) == 0)
 			self->publishStatus();
 		sender->setTimeoutMS(Rog::PollIntervalMS);
@@ -594,6 +854,8 @@ IOReturn RogControl::sleepHandler(void *target, void *refCon, UInt32 messageType
 			if (s->chargeLimit)
 				s->writeChargeLimit(s->chargeLimit);
 			s->forceReapply = true;
+			s->tunablesDirty = true;
+			s->cpuDirty = s->cppcActive;
 			return kIOReturnSuccess;
 		});
 	}

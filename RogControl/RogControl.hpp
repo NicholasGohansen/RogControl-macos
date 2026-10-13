@@ -38,6 +38,38 @@ namespace Rog {
 	constexpr uint32_t DevChargeLimit   = 0x00120057;
 	constexpr uint32_t DevCpuTemp       = 0x00120094;
 
+	// Power limits and NVIDIA settings (Linux asus-wmi / asusd "tunings")
+	enum Tunable : uint8_t {
+		TunePl1,        // PPT_PL1_SPL, sustained package power (W)
+		TunePl2,        // PPT_PL2_SPPT, short boost power (W)
+		TuneFppt,       // PPT_PL3_FPPT, fast boost power (W)
+		TuneNvBoost,    // NV_DYN_BOOST, extra GPU power from the CPU budget (W)
+		TuneNvTemp,     // NV_THERM_TARGET, GPU temperature target (C)
+		TunableCount
+	};
+	struct TunableInfo {
+		const char *name;
+		uint32_t device;
+		uint8_t min, max;
+	};
+	constexpr TunableInfo Tunables[TunableCount] = {
+		{"PowerLimitPL1",   0x001200A3, 5, 150},
+		{"PowerLimitPL2",   0x001200A0, 5, 150},
+		{"PowerLimitFPPT",  0x001200C1, 5, 150},
+		{"GPUDynamicBoost", 0x001200C0, 5, 25},
+		{"GPUTempTarget",   0x001200C2, 75, 87},
+	};
+
+	// AMD CPPC (what Linux amd-pstate uses for scaling_max_freq and EPP)
+	constexpr uint32_t MsrCppcCap1   = 0xC00102B0;
+	constexpr uint32_t MsrCppcEnable = 0xC00102B1;
+	constexpr uint32_t MsrCppcReq    = 0xC00102B3;
+	constexpr uint32_t MsrHwcr       = 0xC0010015;
+	constexpr uint64_t HwcrCpbDis    = 1ULL << 25;
+	constexpr uint32_t MsrPState0    = 0xC0010064;
+	constexpr uint8_t EppPerformance = 0x00, EppBalancePerformance = 0x80,
+		EppBalancePower = 0xBF, EppPower = 0xFF;
+
 	constexpr uint32_t DstsPresent = 0x00010000;
 	constexpr uint32_t DstsUnsupported = 0xFFFFFFFE;
 
@@ -117,6 +149,21 @@ class EXPORT RogControl : public IOService {
 	bool haveFanCurves {false};
 	bool havePolicy {false};
 	bool haveChargeLimit {false};
+	bool haveTunable[Rog::TunableCount] {};
+	uint8_t tunable[Rog::TunableCount] {};  // 0 = firmware default
+	bool tunablesDirty {false};
+
+	// CPU frequency cap through CPPC
+	bool cppcAllowed {true};
+	bool cppcSupported {false};
+	bool cppcActive {false};
+	bool cpuDirty {false};
+	uint32_t cpuMaxMHz {0};                 // 0 = no cap
+	uint8_t cpuEpp {Rog::EppBalancePerformance};
+	uint32_t nominalMHz {0};
+	uint32_t cppcCores {0};
+	uint32_t cppcFailedCores {0};
+	uint8_t cppcHighest {0}, cppcNominal {0}, cppcLowestNonlinear {0}, cppcLowest {0}, cppcMaxPerf {0};
 	bool nvramLoaded {false};
 	uint8_t perfMode {Rog::PerfBalanced};
 	bool perfModeKnown {false};
@@ -136,11 +183,14 @@ class EXPORT RogControl : public IOService {
 	bool writeCurve(size_t fan, const RogFanCurve &curve);
 	bool writePerfMode(uint8_t mode);
 	bool writeChargeLimit(uint8_t limit);
+	void writeTunables();
+	void applyCpuLimit();
 
 	void refreshSensors();
 	void applyFanControl(bool force);
 	void loadNvramSettings();
 	void storeNvramByte(const char *name, uint8_t value);
+	void storeNvramData(const char *name, const void *bytes, size_t len);
 	void publishStatus();
 	void cyclePerfMode();
 
@@ -150,6 +200,7 @@ class EXPORT RogControl : public IOService {
 	static uint8_t curveModeForPolicy(uint8_t mode);
 	static bool validCurve(const RogFanCurve &curve);
 	static void flatCurve(RogFanCurve &curve, uint8_t percent);
+	static bool eppFromObject(OSObject *obj, uint8_t &epp);
 
 	static bool vsmcNotificationHandler(void *sensors, void *refCon, IOService *vsmc, IONotifier *notifier);
 	static IOReturn sleepHandler(void *target, void *refCon, UInt32 messageType, IOService *provider, void *messageArgument, vm_size_t argSize);
