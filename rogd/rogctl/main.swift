@@ -83,6 +83,10 @@ func showStatus() {
 	if let level = num(p, "KeyboardBrightness") {
 		print("Keyboard light   : \(level)/3\(p["KeyboardFound"] as? Bool == true ? "" : " (keyboard not found yet)")")
 	}
+	if let count = num(p, "HotkeyCount") {
+		let hook = p["KeyboardHotkeyHook"] as? Bool == true ? "keyboard hook on" : "keyboard hook OFF"
+		print("Fn keys          : \(hook), \(count) pressed\(count > 0 ? ", last 0x" + String(num(p, "LastHotkey") ?? 0, radix: 16, uppercase: true) : "")")
+	}
 	if let c = curveString(p["AppliedCurveCPU"] as? Data) { print("  CPU curve: \(c)") }
 	if let c = curveString(p["AppliedCurveGPU"] as? Data) { print("  GPU curve: \(c)") }
 }

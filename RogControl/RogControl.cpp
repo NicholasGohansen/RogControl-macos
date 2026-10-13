@@ -691,6 +691,7 @@ void RogControl::publishStatus() {
 	}
 	setProperty("LastHotkey", lastHotkey, 32);
 	setProperty("HotkeyCount", hotkeyCount, 32);
+	setProperty("KeyboardHotkeyHook", orgHandleReportWithTime != 0);
 	setProperty("CPUMaxFrequencyMHz", cpuMaxMHz, 32);
 	setProperty("CPUEnergyPreference", cpuEpp, 32);
 	setProperty("CPUFrequencyLimitActive", cppcActive);
