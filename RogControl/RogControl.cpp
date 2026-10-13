@@ -402,28 +402,19 @@ void RogControl::loadNvramSettings() {
 	if (charge >= 20 && charge <= 100)
 		writeChargeLimit(static_cast<uint8_t>(charge));
 
-	// CPU cap: Info.plist default < NVRAM < boot-args (rogcpumax=MHz, 0 = none; rogepp=0..255).
-	if (auto n = OSDynamicCast(OSNumber, getProperty("DefaultCPUMaxFrequencyMHz")))
-		cpuMaxMHz = n->unsigned32BitValue();
-	if (auto n = OSDynamicCast(OSNumber, getProperty("DefaultCPUEnergyPreference")))
-		cpuEpp = static_cast<uint8_t>(n->unsigned32BitValue());
-	options = IORegistryEntry::fromPath("/options", gIODTPlane);
-	if (options) {
-		auto m = OSDynamicCast(OSData, options->getProperty("rog-cpu-max"));
-		if (m && m->getLength() == 2) {
-			auto b = static_cast<const uint8_t *>(m->getBytesNoCopy());
-			cpuMaxMHz = b[0] | (b[1] << 8);
-		}
-		auto e = OSDynamicCast(OSData, options->getProperty("rog-cpu-epp"));
-		if (e && e->getLength() == 1)
-			cpuEpp = *static_cast<const uint8_t *>(e->getBytesNoCopy());
-		options->release();
-	}
-	if (PE_parse_boot_argn("rogcpumax", &arg, sizeof(arg)) && arg >= 0)
+	// The CPU stays stock (legacy P-states) until something asks for a cap or an energy
+	// preference: rogd from its config, or boot-args rogcpumax=MHz (0 = none) / rogepp=0..255.
+	bool cpuConfigured = false;
+	if (PE_parse_boot_argn("rogcpumax", &arg, sizeof(arg)) && arg >= 0) {
 		cpuMaxMHz = static_cast<uint32_t>(arg);
-	if (PE_parse_boot_argn("rogepp", &arg, sizeof(arg)) && arg >= 0 && arg <= 255)
+		cpuConfigured = true;
+	}
+	if (PE_parse_boot_argn("rogepp", &arg, sizeof(arg)) && arg >= 0 && arg <= 255) {
 		cpuEpp = static_cast<uint8_t>(arg);
-	applyCpuLimit();
+		cpuConfigured = true;
+	}
+	if (cpuConfigured)
+		applyCpuLimit();
 }
 
 void RogControl::storeNvramByte(const char *name, uint8_t value) {
@@ -578,8 +569,6 @@ IOReturn RogControl::setPropertiesGated(OSDictionary *dict) {
 			ret = kIOReturnBadArgument;
 		} else {
 			cpuMaxMHz = mhz;
-			uint8_t bytes[2] = {static_cast<uint8_t>(mhz), static_cast<uint8_t>(mhz >> 8)};
-			storeNvramData("rog-cpu-max", bytes, sizeof(bytes));
 			applyCpuLimit();
 		}
 	}
@@ -590,7 +579,6 @@ IOReturn RogControl::setPropertiesGated(OSDictionary *dict) {
 			ret = kIOReturnBadArgument;
 		} else {
 			cpuEpp = epp;
-			storeNvramByte("rog-cpu-epp", epp);
 			applyCpuLimit();
 		}
 	}
@@ -716,20 +704,6 @@ IOService *RogControl::probe(IOService *provider, SInt32 *score) {
 	for (size_t i = 0; i < Rog::MaxTemps; i++)
 		atomic_init(&shared.temp[i], 0);
 
-	// Default custom curves (16 bytes: 8 temps, 8 percents) from Info.plist. Without them the
-	// boot-time policy write leaves ASUS's quiet factory curve, which lets the CPU run hot.
-	static const char *const defaultCurveKeys[Rog::MaxFans] = {"DefaultFanCurveCPU", "DefaultFanCurveGPU"};
-	for (size_t i = 0; i < Rog::MaxFans; i++) {
-		auto data = OSDynamicCast(OSData, getProperty(defaultCurveKeys[i]));
-		if (data && data->getLength() == sizeof(RogFanCurve)) {
-			RogFanCurve curve;
-			lilu_os_memcpy(&curve, data->getBytesNoCopy(), sizeof(curve));
-			if (validCurve(curve)) {
-				userCurve[i] = curve;
-				userCurveValid[i] = true;
-			}
-		}
-	}
 	atomic_init(&shared.manualMask, 0);
 	atomic_init(&shared.controlDirty, false);
 	refreshSensors();

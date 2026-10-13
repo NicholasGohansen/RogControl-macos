@@ -26,18 +26,6 @@
 		<dict>
 			<key>CFBundleIdentifier</key>
 			<string>com.pengubow.RogControl</string>
-			<key>DefaultCPUEnergyPreference</key>
-			<integer>128</integer>
-			<key>DefaultCPUMaxFrequencyMHz</key>
-			<integer>4200</integer>
-			<key>DefaultFanCurveCPU</key>
-			<data>
-			HCYxOkJLVGMbJjNDTVpjYw==
-			</data>
-			<key>DefaultFanCurveGPU</key>
-			<data>
-			GiMtN0JKU2MkLjxIVV9jYw==
-			</data>
 			<key>FanMaxRPM</key>
 			<array>
 				<integer>6600</integer>

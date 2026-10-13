@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds RogControl.kext and rogctl.
+# Builds RogControl.kext, rogd and rogctl.
 #   ./build.sh [Release|Debug]
 # macOS: uses Xcode or the Command Line Tools (xcrun).
 # Linux: cross build; set TOOLCHAIN (Apple clang + ld64 + otool + nm in bin/) and MACOS_SDK.
@@ -68,11 +68,11 @@ for src in RogControl/RogControl.cpp RogControl/KeyImplementations.cpp; do
     objects+=("$o")
 done
 
-echo "CC  Tools/kmod_info.c"
+echo "CC  RogControl/kmod_info.c"
 "$clang" -target x86_64-apple-macos10.15 -mkernel -fno-builtin -fno-common -nostdlib -DKERNEL \
     -I "$deps/MacKernelSDK/Headers" \
     '-DKMOD_INFO_NAME=kmod_info' '-DKMOD_BUNDLE_ID="com.pengubow.RogControl"' "-DKMOD_BUNDLE_VERSION=\"$version\"" \
-    -c "$here/Tools/kmod_info.c" -o "$obj/kmod_info.o"
+    -c "$here/RogControl/kmod_info.c" -o "$obj/kmod_info.o"
 objects+=("$obj/kmod_info.o")
 
 echo "LD  RogControl.kext"
@@ -95,8 +95,17 @@ if grep -q " U ___cxa_atexit\$" <<<"$symbols"; then
 fi
 echo "built $bundle"
 
-echo "CC  rogctl"
-"$clang_user" -target x86_64-apple-macos11 -isysroot "$sdk" -O2 -Wall -fuse-ld="$ld64" \
-    -framework IOKit -framework CoreFoundation \
-    -o "$out/rogctl" "$here/rogctl/rogctl.c"
-echo "built $out/rogctl"
+# rogd (profile daemon) and rogctl (CLI) are Swift: macOS only.
+if [[ "$(uname)" == Darwin ]]; then
+    swiftc="${SWIFTC:-$(xcrun -f swiftc)}"
+    swiftflags=(-target x86_64-apple-macos13 -sdk "$sdk" -framework IOKit)
+    [[ "$config" == Release ]] && swiftflags+=(-O) || swiftflags+=(-Onone -g)
+    for tool in rogd rogctl; do
+        echo "SWIFT $tool"
+        "$swiftc" "${swiftflags[@]}" -module-name "$tool" -o "$out/$tool" \
+            "$here"/rogd/Shared/*.swift "$here/rogd/$tool/main.swift"
+        echo "built $out/$tool"
+    done
+else
+    echo "skipping rogd and rogctl (Swift, macOS only)"
+fi
