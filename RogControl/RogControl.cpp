@@ -56,21 +56,27 @@ static mach_vm_address_t orgHandleReportWithTime {0};
 static _Atomic(IOHIDDevice *) hookKeyboard;         // statics start zeroed
 static _Atomic(uint32_t) hookCode;
 static _Atomic(IOInterruptEventSource *) hookSignal;
+static _Atomic(uint32_t) hookPowerDropped;
 
 static IOReturn wrapHandleReportWithTime(IOHIDDevice *that, AbsoluteTime timeStamp, IOMemoryDescriptor *report,
 	IOHIDReportType reportType, IOOptionBits options) {
 	if (that == atomic_load_explicit(&hookKeyboard, memory_order_relaxed) && reportType == kIOHIDReportTypeInput &&
 		report && report->getLength() >= 2) {
-		uint8_t head[2] {};
+		uint8_t head[3] {};
+		size_t length = report->getLength() < sizeof(head) ? report->getLength() : sizeof(head);
 		auto buffer = OSDynamicCast(IOBufferMemoryDescriptor, report);
 		if (buffer && buffer->getBytesNoCopy())
-			lilu_os_memcpy(head, buffer->getBytesNoCopy(), sizeof(head));
+			lilu_os_memcpy(head, buffer->getBytesNoCopy(), length);
 		else
-			report->readBytes(0, head, sizeof(head));
+			report->readBytes(0, head, length);
 		auto signal = atomic_load_explicit(&hookSignal, memory_order_acquire);
 		if (head[0] == Rog::KbdReportID && head[1] != 0 && signal) {
 			atomic_store_explicit(&hookCode, head[1], memory_order_release);
 			signal->interruptOccurred(nullptr, nullptr, 0);
+		}
+		if (head[0] == Rog::KbdConsumerReportID && head[1] == Rog::KbdConsumerPower && head[2] == 0) {
+			atomic_fetch_add_explicit(&hookPowerDropped, 1, memory_order_relaxed);
+			return kIOReturnSuccess;
 		}
 	}
 	return FunctionCast(wrapHandleReportWithTime, orgHandleReportWithTime)(that, timeStamp, report, reportType, options);
@@ -686,6 +692,7 @@ void RogControl::publishStatus() {
 	setProperty("LastHotkey", lastHotkey, 32);
 	setProperty("HotkeyCount", hotkeyCount, 32);
 	setProperty("KeyboardHotkeyHook", orgHandleReportWithTime != 0);
+	setProperty("KeyboardPowerReportsDropped", atomic_load_explicit(&hookPowerDropped, memory_order_relaxed), 32);
 	setProperty("BrightnessKeys", keys != nullptr);
 	if (auto log = OSArray::withCapacity(Rog::EventLogSize)) {
 		uint32_t first = eventCount > Rog::EventLogSize ? eventCount - static_cast<uint32_t>(Rog::EventLogSize) : 0;

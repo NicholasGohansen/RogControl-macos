@@ -6,7 +6,8 @@ let rogdServiceName = "com.pengubow.rogd"
 
 @objc protocol RogdService {
 	/// Commands: profile <quiet|balanced|performance>, auto <on|off>, kbd <0-3>,
-	/// touchpad <on|off>, charge <20-100>, aura <Aura as JSON>.
+	/// touchpad <on|off>, charge <20-100>, aura <Aura as JSON>,
+	/// brightness <0-1> (only remembered: the app sets the panel itself).
 	/// The reply is nil on success, otherwise what went wrong.
 	func run(_ command: String, _ argument: String, reply: @escaping (String?) -> Void)
 }

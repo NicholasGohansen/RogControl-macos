@@ -7,7 +7,10 @@ let statePath = "/Library/Application Support/RogControl/state.json"
 struct State: Codable, Equatable {
 	var profile: String?         // quiet / balanced / performance
 	var keyboardLight: Int?      // 0-3
-	var screenBrightness: Int?   // EC backlight level (hybrid mode); otherwise macOS keeps its own
+	var screenBrightness: Int?   // EC backlight level (hybrid mode)
+	var panelBrightness: Double? // 0-1 as macOS sees it (dGPU mode), kept by the menu bar app
+	var touchpad: Bool?          // Fn+F10
+	var micMuted: Bool?          // the mic-mute key (default input device)
 
 	static func load(_ path: String = statePath) -> State {
 		let decoder = JSONDecoder()

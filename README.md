@@ -19,7 +19,9 @@ same ASUS WMI calls Linux `asus-wmi` makes (`\_SB.ATKD.WMNB`):
 - the N-KEY keyboard's Fn keys, read from its vendor input report (0x5A) through a Lilu hook on
   `IOHIDDevice::handleReportWithTime`, which also works while Karabiner-Elements holds the
   keyboard: Fn+F2/F3 keyboard light, Fn+F5 mode, Fn+F7/F8 screen brightness, Fn+F10 touchpad
-  (VoodooI2C); the mic-mute key is handled by `rogd`
+  (VoodooI2C); the mic-mute key is handled by `rogd`. The same hook drops the consumer "Power"
+  reports the G713/G733 firmware sometimes sends along with ordinary keys (they open macOS's
+  shut down dialog; Linux `hid-asus` drops them too)
 - keyboard backlight (HID feature report, like Linux `hid-asus`)
 - screen brightness: with the MUX in dGPU mode the NVIDIA driver drives the panel, so Fn+F7/F8
   are sent to macOS as brightness keys (needs the nullmoth NVIDIA driver with boot-arg
@@ -56,8 +58,10 @@ counterpart of asusd) applies them:
 
 - one profile per performance mode: `quiet` (ASUS Silent), `balanced`, `performance` (Turbo),
   each with fan curves, a CPU energy preference (EPP) and power "tunings" for AC and battery
-- at start: the last profile used, keyboard light and brightness key style, kept in
-  `state.json` next to the config (the kext itself changes nothing at boot)
+- at start: the last profile used, keyboard light, touchpad on/off and microphone mute, kept
+  in `state.json` next to the config (the kext itself changes nothing at boot); the panel
+  brightness is kept there too and put back by the menu bar app after login (macOS would keep it
+  in NVRAM, which OpenCore doesn't let it write here)
 - when the mode changes (Fn+F5 or `rogctl profile`), and on AC <-> battery, optionally
   switching profile with the power source (`auto_profile`)
 - global CPU frequency cap and battery charge limit

@@ -103,6 +103,10 @@ namespace Rog {
 	// N-KEY USB keyboard (Linux hid-asus): feature report 0x5A
 	constexpr uint32_t AsusVendorID = 0x0B05;
 	constexpr uint8_t KbdReportID = 0x5A;
+	// The G713/G733 firmware sometimes sends consumer "Power" (report 0x02, usage 0x30) along with
+	// ordinary key presses; macOS then opens the shut down dialog. hid-asus drops these reports.
+	constexpr uint8_t KbdConsumerReportID = 0x02;
+	constexpr uint8_t KbdConsumerPower = 0x30;
 	// Aura lighting: output report 0x5D (asusd writes it padded to the 64-byte report size),
 	// after a feature report "]ASUS Tech.Inc." like hid-asus sends at probe.
 	constexpr uint8_t AuraReportID = 0x5D;

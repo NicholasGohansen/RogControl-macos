@@ -60,7 +60,14 @@ extension Daemon {
 		case "touchpad":
 			guard ["on", "off"].contains(argument) else { return "touchpad needs on or off" }
 			let ret = kext.set(["TouchpadEnabled": argument == "on"])
+			recordState()
 			return ret == KERN_SUCCESS ? nil : "no touchpad driver answered"
+		case "brightness":
+			// The menu bar app sets the panel itself (rogd has no window server); rogd keeps the level.
+			guard let value = Double(argument), (0...1).contains(value) else { return "brightness needs 0-1" }
+			state.panelBrightness = value
+			saveState()
+			return nil
 		case "charge":
 			guard let limit = Int(argument), (20...100).contains(limit) else { return "charge needs 20-100" }
 			config.chargeLimit = limit

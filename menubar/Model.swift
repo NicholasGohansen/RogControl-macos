@@ -34,6 +34,14 @@ final class StatusModel: ObservableObject {
 	private var auraSend: DispatchWorkItem?
 	var panelOpen = false
 
+	// The panel brightness doesn't survive a restart here (macOS keeps it in NVRAM, which OpenCore
+	// doesn't let it write), and rogd can't reach the display: the app puts back the level rogd
+	// kept, then reports changes (keys, Control Center, the slider) for rogd to keep.
+	private let savedBrightness = State.load().panelBrightness.map { Float($0) }
+	private var brightnessFound: Date?
+	private var bootBrightness: Float = 0
+	private var keptBrightness: Float?
+
 	init() {
 		refresh()
 		timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.refresh() }
@@ -49,6 +57,7 @@ final class StatusModel: ObservableObject {
 		cpuFan = number(p, "CPU Fan RPM")
 		gpuFan = number(p, "GPU Fan RPM")
 		onBattery = onBatteryPower()
+		keepBrightness()
 		// The rest is only shown in the panel, and not while the user's own change settles.
 		guard panelOpen, Date() > heldUntil else { return }
 		if let mode = p["PerformanceMode"] as? String, let name = profileName(forKextMode: mode) { profile = name }
@@ -78,6 +87,31 @@ final class StatusModel: ObservableObject {
 	}
 
 	private func hold() { heldUntil = Date().addingTimeInterval(2.5) }
+
+	private func keepBrightness() {
+		guard let current = panelBrightness() else { return }  // the backlight isn't registered yet
+		guard let found = brightnessFound else {
+			brightnessFound = Date()
+			bootBrightness = current
+			keptBrightness = savedBrightness  // nothing saved yet: report the current level
+			// Only right after boot: an app restart later finds the level the user has now.
+			if let saved = savedBrightness, ProcessInfo.processInfo.systemUptime < 300, abs(saved - current) > 0.005 {
+				_ = setPanelBrightness(saved)
+			}
+			return
+		}
+		if Date().timeIntervalSince(found) < 12 {
+			// macOS may still set its own level just after login: put the saved one back over that.
+			if let saved = savedBrightness, ProcessInfo.processInfo.systemUptime < 300,
+				abs(current - bootBrightness) < 0.005, abs(current - saved) > 0.005 {
+				_ = setPanelBrightness(saved)
+			}
+			return
+		}
+		if let kept = keptBrightness, abs(current - kept) < 0.005 { return }
+		keptBrightness = current
+		client.run("brightness", String(format: "%.4f", current))
+	}
 
 	private func run(_ command: String, _ argument: String) {
 		hold()

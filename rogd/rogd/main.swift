@@ -24,25 +24,39 @@ enum Hotkey: UInt32 {
 	case auraKey = 0xB3
 }
 
-/// Mutes or unmutes the default input device (the keyboard's mic-mute key).
-func toggleMicMute() -> String {
+/// The default input device's mute control, if there is one (not before coreaudiod and the
+/// audio driver are up).
+func inputMuteControl() -> (AudioObjectID, AudioObjectPropertyAddress)? {
 	var device = AudioObjectID(kAudioObjectUnknown)
 	var size = UInt32(MemoryLayout<AudioObjectID>.size)
 	var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultInputDevice,
 		mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
 	guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &device) == noErr,
-		device != kAudioObjectUnknown else { return "no input device" }
+		device != kAudioObjectUnknown else { return nil }
 	address = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyMute,
 		mScope: kAudioDevicePropertyScopeInput, mElement: kAudioObjectPropertyElementMain)
+	return AudioObjectHasProperty(device, &address) ? (device, address) : nil
+}
+
+func micMuted() -> Bool? {
+	guard let (device, mute) = inputMuteControl() else { return nil }
+	var address = mute
 	var muted: UInt32 = 0
-	size = UInt32(MemoryLayout<UInt32>.size)
-	guard AudioObjectHasProperty(device, &address),
-		AudioObjectGetPropertyData(device, &address, 0, nil, &size, &muted) == noErr else {
-		return "input device has no mute control"
-	}
-	muted = muted == 0 ? 1 : 0
-	let ret = AudioObjectSetPropertyData(device, &address, 0, nil, size, &muted)
-	return ret == noErr ? (muted == 1 ? "microphone muted" : "microphone unmuted") : "mute failed (\(ret))"
+	var size = UInt32(MemoryLayout<UInt32>.size)
+	return AudioObjectGetPropertyData(device, &address, 0, nil, &size, &muted) == noErr ? muted != 0 : nil
+}
+
+func setMicMuted(_ muted: Bool) -> Bool {
+	guard let (device, mute) = inputMuteControl() else { return false }
+	var address = mute
+	var value: UInt32 = muted ? 1 : 0
+	return AudioObjectSetPropertyData(device, &address, 0, nil, UInt32(MemoryLayout<UInt32>.size), &value) == noErr
+}
+
+/// Mutes or unmutes the default input device (the keyboard's mic-mute key).
+func toggleMicMute() -> String {
+	guard let muted = micMuted() else { return "no input device with a mute control" }
+	return setMicMuted(!muted) ? (muted ? "microphone unmuted" : "microphone muted") : "mute failed"
 }
 
 final class Daemon {
@@ -58,6 +72,11 @@ final class Daemon {
 	var lastOnBattery = onBatteryPower()
 	var notifyPort: IONotificationPortRef?
 	var hotkeyNotification: io_object_t = 0
+	/// Saved settings whose device may come up after rogd (the touchpad driver, the audio input):
+	/// retried for a while, and their current value is recorded only once they are back.
+	var touchpadRestored = false
+	var micRestored = false
+	var restoreTries = 0
 
 	/// Hotkeys the kext doesn't handle itself (it does Fn+F5, Fn+F2/F3, Fn+F7/F8 and Fn+F10).
 	func listenForHotkeys() {
@@ -76,6 +95,7 @@ final class Daemon {
 		switch Hotkey(rawValue: code) {
 		case .micMute:
 			log("mic-mute key: \(toggleMicMute())")
+			recordState()
 		case .rogKey:
 			break  // opens the menu bar app's panel (the app listens itself)
 		case .auraKey:
@@ -163,6 +183,9 @@ final class Daemon {
 			return
 		}
 		guard let mode = kext?.mode else { return }
+		if !(touchpadRestored && micRestored) {
+			restoreDevices()
+		}
 		if let pending = pendingProfile {
 			apply(profile: pending, setMode: true, reason: "start, last used (retry)")
 			return
@@ -210,17 +233,53 @@ final class Daemon {
 			req["KeyboardBrightness"] = level
 		}
 		if let level = state.screenBrightness, kext.properties()["ScreenBrightness"] != nil { req["ScreenBrightness"] = level }
-		guard !req.isEmpty else { return }
-		let ret = kext.set(req)
-		log("restored \(req.keys.sorted().joined(separator: ", "))\(ret == KERN_SUCCESS ? "" : String(format: " (kext: 0x%x)", ret))")
+		if !req.isEmpty {
+			let ret = kext.set(req)
+			log("restored \(req.keys.sorted().joined(separator: ", "))\(ret == KERN_SUCCESS ? "" : String(format: " (kext: 0x%x)", ret))")
+		}
+		restoreDevices()
 	}
 
-	/// Remembers changes made with the keys (Fn+F2/F3, Fn+F7/F8) or rogctl.
+	/// The touchpad (Fn+F10) and the microphone mute, once their drivers answer.
+	func restoreDevices() {
+		guard let kext = kext else { return }
+		if !touchpadRestored {
+			if let on = state.touchpad {
+				if kext.set(["TouchpadEnabled": on]) == KERN_SUCCESS {
+					touchpadRestored = true
+					log("restored touchpad \(on ? "on" : "off")")
+				}
+			} else {
+				touchpadRestored = true
+			}
+		}
+		if !micRestored {
+			if let muted = state.micMuted {
+				if setMicMuted(muted) {
+					micRestored = true
+					log("restored microphone \(muted ? "muted" : "unmuted")")
+				}
+			} else {
+				micRestored = true
+			}
+		}
+		restoreTries += 1
+		if restoreTries >= 90 && !(touchpadRestored && micRestored) {
+			log("gave up restoring the\(touchpadRestored ? "" : " touchpad")\(micRestored ? "" : " microphone mute") (no driver answered)")
+			touchpadRestored = true
+			micRestored = true
+		}
+	}
+
+	/// Remembers changes made with the keys (Fn+F2/F3, Fn+F7/F8, Fn+F10, mic mute), rogctl or
+	/// System Settings.
 	func recordState() {
 		guard let props = kext?.properties() else { return }
 		var next = state
 		if let level = props["KeyboardBrightness"] as? Int { next.keyboardLight = level }
 		if let level = props["ScreenBrightness"] as? Int { next.screenBrightness = level }
+		if touchpadRestored, let on = props["TouchpadEnabled"] as? Bool { next.touchpad = on }
+		if micRestored, let muted = micMuted() { next.micMuted = muted }
 		if next != state {
 			state = next
 			saveState()
