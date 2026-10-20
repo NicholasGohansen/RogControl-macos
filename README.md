@@ -158,3 +158,7 @@ System Settings > General > Login Items.
   and menu bar app.
 - Linux `asus-wmi`, `asusctl` and G-Helper, for the WMI device IDs and behaviour this relies on.
 - Acidanthera (Lilu, VirtualSMC).
+
+## Contact
+Any question?
+Chat me on instagram [@nicholasgohansen](https://instagram.com/nicholasgohansen) or Discord `@nicholasgo`
