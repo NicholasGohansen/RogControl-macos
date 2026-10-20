@@ -1,0 +1,68 @@
+--- /mnt/user-data/uploads/RogControl.cpp	2026-10-18 15:21:54.180608000 +0000
++++ RogControl.cpp	2026-10-18 19:32:02.892338840 +0000
+@@ -350,6 +350,17 @@
+ bool RogControl::writeKbdLevel(uint8_t level) {
+ 	if (level > Rog::KbdMaxLevel)
+ 		return false;
++	// TUF fallback: without an ASUS USB (N-KEY) keyboard, drive the backlight through the
++	// ASUS WMI keyboard backlight device (0x00050021, value 0x80 | level, like Linux asus-wmi).
++	if (!findKeyboard()) {
++		uint32_t wmiValue = 0;
++		if (!wmnbInt(Rog::MethodDevs, 0x00050021, 0x80 | level, wmiValue))
++			return false;
++		kbdLevel = level;
++		kbdLevelKnown = true;
++		kbdPending = false;
++		return true;
++	}
+ 	if (!kbdReady) {
+ 		// hid-asus asus_kbd_init(): the keyboard wants this before taking commands.
+ 		static const uint8_t init[] = {Rog::KbdReportID, 'A', 'S', 'U', 'S', ' ', 'T', 'e', 'c', 'h', '.', 'I', 'n', 'c', '.', 0};
+@@ -785,6 +796,24 @@
+ 		else if (code == Rog::EventKbdLightDown && level > 0)
+ 			level--;
+ 		writeKbdLevel(level);
++	} else if (code == 0xB3) {
++		// TUF Fn+F4: cycle keyboard RGB presets {mode, R, G, B, speed}; WMI 0x00100056 like G-Helper.
++		static const uint8_t presets[][5] = {
++			{0, 0xFF, 0x00, 0x00, 0xF5},  // static red
++			{0, 0x00, 0xFF, 0x00, 0xF5},  // static green
++			{0, 0x00, 0x00, 0xFF, 0xF5},  // static blue
++			{0, 0xFF, 0xFF, 0xFF, 0xF5},  // static white
++			{1, 0xFF, 0xFF, 0xFF, 0xEB},  // breathe white
++			{2, 0xFF, 0xFF, 0xFF, 0xEB},  // colour cycle
++		};
++		static uint8_t presetIndex = 0;
++		const uint8_t *b = presets[presetIndex];
++		presetIndex = (presetIndex + 1) % (sizeof(presets) / sizeof(presets[0]));
++		uint32_t a1 = 0xB4U | (static_cast<uint32_t>(b[0]) << 8) | (static_cast<uint32_t>(b[1]) << 16) | (static_cast<uint32_t>(b[2]) << 24);
++		uint32_t a2 = static_cast<uint32_t>(b[3]) | (static_cast<uint32_t>(b[4]) << 8);
++		OSObject *rgbResult = nullptr;
++		wmnb(Rog::MethodDevs, 0x00100056, a1, a2, 0, 0, &rgbResult);
++		OSSafeReleaseNULL(rgbResult);
+ 	} else if (code == Rog::EventTouchpadToggle) {
+ 		setTouchpad(!touchpadEnabled);
+ 	} else if ((code == Rog::EventScreenDown || code == Rog::EventScreenUp) && screenSource != Rog::BacklightSourceEc) {
+@@ -883,6 +912,22 @@
+ 		}
+ 	}
+ 
++	// TUF keyboard RGB through ASUS WMI (DEVS 0x00100056, what G-Helper sends as
++	// B4-mode-R-G-B-speed). Property "TufRgb": 5 bytes {mode, R, G, B, speed}.
++	if (auto rgb = OSDynamicCast(OSData, dict->getObject("TufRgb"))) {
++		if (rgb->getLength() != 5) {
++			ret = kIOReturnBadArgument;
++		} else {
++			auto b = static_cast<const uint8_t *>(rgb->getBytesNoCopy());
++			uint32_t a1 = 0xB4U | (static_cast<uint32_t>(b[0]) << 8) | (static_cast<uint32_t>(b[1]) << 16) | (static_cast<uint32_t>(b[2]) << 24);
++			uint32_t a2 = static_cast<uint32_t>(b[3]) | (static_cast<uint32_t>(b[4]) << 8);
++			OSObject *rgbResult = nullptr;
++			if (!wmnb(Rog::MethodDevs, 0x00100056, a1, a2, 0, 0, &rgbResult))
++				ret = kIOReturnNotResponding;
++			OSSafeReleaseNULL(rgbResult);
++		}
++	}
++
+ 	if (auto flag = OSDynamicCast(OSBoolean, dict->getObject("TouchpadEnabled"))) {
+ 		if (!setTouchpad(flag->isTrue()))
+ 			ret = kIOReturnNotFound;
